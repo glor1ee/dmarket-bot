@@ -1,5 +1,5 @@
 import time
-from dmarket import get_recommended_skins, get_market_depth, get_last_sales_raw
+from dmarket import get_recommended_skins, get_market_depth, get_last_sales_raw, get_min_offer
 
 
 def main():
@@ -24,6 +24,8 @@ def main():
             if title in seen:
                 continue
 
+            seen.add(title)
+
             orders = get_market_depth(title)
             if not orders:
                 continue
@@ -37,12 +39,18 @@ def main():
             if net < 1 or net > 10:
                 continue
 
-            seen.add(title)
-            diff = price - max_target
+            min_offer = get_min_offer(title)
+            print(f"Min offer: {min_offer}")
+
+            net = min_offer * 0.93 - max_target
+            if net < 1 or net > 10:
+                continue
+
+            diff = min_offer - max_target
             emoji = "🟢" if diff < 2 else "🔴"
             print(
                 f"{emoji} {title}\n"
-                f"   ОФФЕР: ${price:.2f} | ТАРГЕТ: ${max_target:.2f} | "
+                f"   ОФФЕР: ${min_offer:.2f} | ТАРГЕТ: ${max_target:.2f} | "
                 f"Прибыль: ${net:.2f}"
             )
 

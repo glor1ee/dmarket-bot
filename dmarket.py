@@ -53,6 +53,28 @@ def get_market_depth(exact_title: str) -> list:
         return []
 
 
+def get_min_offer(title: str) -> float | None:
+    url = f"{BASE_URL}/exchange/v1/appraise/targets"
+    body = {"objects": [{"title": title}], "gameId": GAME_ID}
+    try:
+        r = requests.post(
+            url,
+            json=body,
+            headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return None
+        for obj in r.json().get("objects", []):
+            for price_entry in obj.get("stats", {}).get("prices", []):
+                if price_entry.get("name") == "minOfferPrice":
+                    amount = price_entry.get("amount", 0)
+                    return int(amount) / 100 if amount else None
+        return None
+    except Exception:
+        return None
+
+
 def get_last_sales_raw(exact_title: str, limit: int = 20) -> list:
     from urllib.parse import quote
     encoded = quote(exact_title, safe="()")

@@ -2,7 +2,11 @@ import discord
 import os
 import asyncio
 import requests.utils
+from collections import Counter
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+
+KYIV = timezone(timedelta(hours=3))
 from dmarket import get_recommended_skins, get_market_depth, get_last_sales_raw
 
 load_dotenv()
@@ -10,6 +14,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1510652051749732544
 PROFIT_CHANNEL_ID = 1511801054918869196
 REVIEW_CHANNEL_ID = 1511801444825698404
+LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -40,6 +45,7 @@ async def scan_loop():
     await client.wait_until_ready()
     profit_channel = client.get_channel(PROFIT_CHANNEL_ID)
     review_channel = client.get_channel(REVIEW_CHANNEL_ID)
+    liquid_profit_channel = client.get_channel(LIQUID_PROFIT_CHANNEL_ID)
     seen: set[str] = set()
 
     while not client.is_closed():
@@ -90,9 +96,14 @@ async def scan_loop():
                 f"{emoji} **{title}**",
                 f"   ОФФЕР: **${price:.2f}** | ТАРГЕТ: **${max_target:.2f}** | Прибыль: **${net:.2f}**",
             ]
+            day_counts = Counter()
             if sales:
                 for s in sales:
-                    lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?')}")
+                    ts = int(s.get("date", 0))
+                    dt = datetime.fromtimestamp(ts, tz=KYIV)
+                    date_str = dt.strftime("%d %b %Y %H:%M")
+                    day_counts[dt.strftime("%d %b %Y")] += 1
+                    lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?'):<8} {date_str}")
             if offer_prices:
                 lines.append(f"   Макс оффер:  **${max(offer_prices):.2f}**")
                 lines.append(f"   Сред оффер:  **${avg_offer:.2f}**")
@@ -101,9 +112,15 @@ async def scan_loop():
             if profit <= -5:
                 continue
             lines.append(f"   Прибыль (сред−7%−таргет): **${profit:.2f}**")
+            liquid = day_counts and any(count > 3 for count in day_counts.values())
+            max_day = max(day_counts.values()) if day_counts else 0
+            lines.append(f"   Итог: {'✅ Ликвидный' if liquid else '❌ Не ликвидный'} (макс продаж за день: {max_day})")
 
             channel = profit_channel if emoji == "🟢" else review_channel
             await channel.send(content="\n".join(lines), view=LinkButton(title=title))
+
+            if emoji == "🟢" and liquid:
+                await liquid_profit_channel.send(content="\n".join(lines), view=LinkButton(title=title))
             await asyncio.sleep(0.5)
 
         await asyncio.sleep(5)

@@ -1,19 +1,26 @@
 import time as _time
-import random
 import requests
+import os
+from dotenv import load_dotenv
 from auth import BASE_URL, GAME_ID, generate_headers
 from liquidity import is_liquid
 
-SORT_OPTIONS = [
-    ("personal", "desc"),
+load_dotenv()
+_JWT = os.getenv("DMARKET_JWT", "").strip()
+
+_SORT_OPTIONS = [
     ("price", "asc"),
     ("price", "desc"),
     ("updated", "desc"),
+    ("personal", "desc"),
 ]
+_sort_idx = 0
 
 
 def get_recommended_skins() -> list:
-    order_by, order_dir = random.choice(SORT_OPTIONS)
+    global _sort_idx
+    order_by, order_dir = _SORT_OPTIONS[_sort_idx % len(_SORT_OPTIONS)]
+    _sort_idx += 1
     path = "/exchange/v1/market/items"
     params = (
         f"?side=market&orderBy={order_by}&orderDir={order_dir}"
@@ -29,7 +36,6 @@ def get_recommended_skins() -> list:
         skins = response.json().get("objects", [])
     except Exception:
         raise ValueError(f"Не JSON (статус {response.status_code}): {response.text[:200]}")
-    random.shuffle(skins)
     return skins
 
 
@@ -47,12 +53,25 @@ def get_market_depth(exact_title: str) -> list:
         return []
 
 
-def get_last_sales(exact_title: str) -> tuple[int, int]:
-    """Возвращает (total_sales_24h, target_sales_24h)."""
-    url = f"{BASE_URL}/trade-aggregator/v1/last-sales"
-    params = {"title": exact_title, "gameId": GAME_ID, "limit": 100}
+def get_last_sales_raw(exact_title: str, limit: int = 20) -> list:
+    from urllib.parse import quote
+    encoded = quote(exact_title, safe="()")
+    url = f"{BASE_URL}/trade-aggregator/v1/last-sales?title={encoded}&gameId={GAME_ID}&limit={limit}"
     try:
-        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        r = requests.get(url, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code != 200:
+            return []
+        return r.json().get("sales", [])
+    except Exception:
+        return []
+
+
+def get_last_sales(exact_title: str) -> tuple[int, int]:
+    from urllib.parse import quote
+    encoded = quote(exact_title, safe="()")
+    url = f"{BASE_URL}/trade-aggregator/v1/last-sales?title={encoded}&gameId={GAME_ID}&limit=100"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         if r.status_code != 200:
             return 0, 0
         sales = r.json().get("sales", [])

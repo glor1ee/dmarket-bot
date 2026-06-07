@@ -1,7 +1,7 @@
 import time
 from collections import Counter
 from datetime import datetime, timezone, timedelta
-from dmarket import get_recommended_skins, get_market_depth, get_last_sales_raw, get_min_offer
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales_raw
 
 KYIV = timezone(timedelta(hours=3))
 
@@ -14,7 +14,7 @@ def main():
             skins = get_recommended_skins()
         except Exception as e:
             print(f"Ошибка: {e}")
-            time.sleep(5)
+            pass
             continue
 
         print(f"Загружено {len(skins)} скинов, проверяю...")
@@ -30,21 +30,9 @@ def main():
 
             seen.add(title)
 
-            orders = get_market_depth(title)
-            if not orders:
+            min_offer, max_target = get_aggregated_prices(title)
+            if min_offer is None or max_target is None or max_target == 0:
                 continue
-
-            max_target = int(orders[0]["price"]) / 100
-            if max_target == 0:
-                continue
-
-            net = price * 0.93 - max_target
-
-            if net < 1 or net > 10:
-                continue
-
-            min_offer = get_min_offer(title)
-            print(f"Min offer: {min_offer}")
 
             net = min_offer * 0.93 - max_target
             if net < 1 or net > 10:

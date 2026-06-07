@@ -7,7 +7,8 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_market_depth, get_last_sales_raw, get_min_offer
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales_raw, place_target, delete_target, get_user_targets, get_user_offers
+from embed import target_embed, my_targets_embed
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -16,29 +17,140 @@ PROFIT_CHANNEL_ID = 1511801054918869196
 REVIEW_CHANNEL_ID = 1511801444825698404
 LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
 
+MY_TARGETS_CHANNEL_ID = 1513236279905616054
+MY_OFFERS_CHANNEL_ID = 1513236353251414186
+TARTGETS_CHANNEL_ID = 1513234981269278750
+
 intents = discord.Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-class LinkButton(discord.ui.View):
-    def __init__(self, title: str):
-        super().__init__(timeout=180)
-        self.title = title
+class DeleteTargetView(discord.ui.View):
+    def __init__(self, target_id: str):
+        super().__init__(timeout=None)
+        self.target_id = target_id
 
-    @discord.ui.button(label="🔗 Открыть на DMarket", style=discord.ButtonStyle.secondary)
-    async def get_link(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        link = (
-            "https://dmarket.com/ingame-items/item-list/csgo-skins"
-            f"?title={requests.utils.quote(self.title)}"
-        )
+    @discord.ui.button(label="🗑 Удалить таргет", style=discord.ButtonStyle.danger)
+    async def delete_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        ok, err = await asyncio.to_thread(delete_target, self.target_id)
+        if ok:
+            _button.disabled = True
+            _button.label = "✅ Таргет удалён"
+            await interaction.message.edit(view=self)
+            await interaction.followup.send("✅ Таргет удалён.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
+
+
+class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"):
+    price_input = discord.ui.TextInput(
+        label="Цена таргета (USD)",
+        placeholder="например: 45.50",
+        required=True,
+        max_length=10,
+    )
+
+    def __init__(self, skin_title: str):
+        super().__init__()
+        self.skin_title = skin_title
+
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            await interaction.user.send(f"<{link}>")
-            await interaction.response.send_message("✅ Ссылка отправлена в ЛС!", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Не могу отправить ЛС — открой личные сообщения от ботов в настройках.",
-                ephemeral=True,
-            )
+            price_val = float(self.price_input.value.replace(",", "."))
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный формат цены.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        ok, err, target_id = await asyncio.to_thread(place_target, self.skin_title, price_val)
+        if ok:
+            await interaction.followup.send(f"✅ Таргет поставлен: **${price_val:.2f}**", ephemeral=True)
+            targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
+            if targets_channel and target_id:
+                await targets_channel.send(
+                    embed=target_embed(self.skin_title, price_val, interaction.user),
+                    view=DeleteTargetView(target_id=target_id),
+                )
+        else:
+            await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
+
+
+class LinkButton(discord.ui.View):
+    def __init__(self, title: str, max_target: float):
+        super().__init__(timeout=None)
+        self.title = title
+        self.max_target = max_target
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label == "🎯 Авто-таргет":
+                child.label = f"🎯 Авто-таргет (${max_target + 0.02:.2f})"
+                break
+
+        url = (
+            "https://dmarket.com/ingame-items/item-list/csgo-skins"
+            f"?title={requests.utils.quote(title)}"
+        )
+        self.add_item(discord.ui.Button(
+            label="🔗 Открыть на DMarket",
+            url=url,
+            style=discord.ButtonStyle.link,
+        ))
+
+    @discord.ui.button(label="🎯 Авто-таргет", style=discord.ButtonStyle.success)
+    async def auto_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        auto_price = round(self.max_target + 0.02, 2)
+        await interaction.response.defer(ephemeral=True)
+        ok, err, target_id = await asyncio.to_thread(place_target, self.title, auto_price)
+        if ok:
+            await interaction.followup.send(f"✅ Авто-таргет поставлен: **${auto_price:.2f}**", ephemeral=True)
+            targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
+            if targets_channel and target_id:
+                await targets_channel.send(
+                    embed=target_embed(self.title, auto_price, interaction.user),
+                    view=DeleteTargetView(target_id=target_id),
+                )
+        else:
+            await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
+
+    @discord.ui.button(label="🎯 Свой таргет", style=discord.ButtonStyle.primary)
+    async def place_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(PlaceTargetModal(skin_title=self.title))
+
+
+class TargetsControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📋 Все таргеты", style=discord.ButtonStyle.secondary, custom_id="targets_all")
+    async def all_targets(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        items = await asyncio.to_thread(get_user_targets)
+        await interaction.followup.send(embed=my_targets_embed(items, "all"), ephemeral=True)
+
+    @discord.ui.button(label="🟢 Активные", style=discord.ButtonStyle.success, custom_id="targets_active")
+    async def active_targets(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        items = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_ACTIVE")
+        await interaction.followup.send(embed=my_targets_embed(items, "active"), ephemeral=True)
+
+    @discord.ui.button(label="🔴 Неактивные", style=discord.ButtonStyle.danger, custom_id="targets_inactive")
+    async def inactive_targets(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        items = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_INACTIVE")
+        await interaction.followup.send(embed=my_targets_embed(items, "inactive"), ephemeral=True)
+
+
+class OffersControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📦 Мои офферы", style=discord.ButtonStyle.secondary, custom_id="offers_all")
+    async def all_offers(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        items = await asyncio.to_thread(get_user_offers)
+        await interaction.followup.send(f"📦 Офферы ({len(items)}):\n{format_offers(items)}", ephemeral=True)
 
 
 async def scan_loop():
@@ -53,7 +165,6 @@ async def scan_loop():
             skins = await asyncio.to_thread(get_recommended_skins)
         except Exception as e:
             print(f"Ошибка: {e}")
-            await asyncio.sleep(5)
             continue
 
         for item in skins:
@@ -68,20 +179,8 @@ async def scan_loop():
 
             seen.add(title)
 
-            orders = await asyncio.to_thread(get_market_depth, title)
-            if not orders:
-                continue
-
-            max_target = int(orders[0]["price"]) / 100
-            if max_target == 0:
-                continue
-
-            net = price * 0.93 - max_target
-            if net < 1 or net > 10:
-                continue
-
-            min_offer = await asyncio.to_thread(get_min_offer, title)
-            if min_offer is None:
+            min_offer, max_target = await asyncio.to_thread(get_aggregated_prices, title)
+            if min_offer is None or max_target is None or max_target == 0:
                 continue
 
             net = min_offer * 0.93 - max_target
@@ -128,29 +227,70 @@ async def scan_loop():
 
             avg_per_day = sum(day_counts.values()) / len(day_counts)
             lines.append(f"   Прибыль (сред−7%−таргет): **${profit:.2f}**")
-            lines.append(f"   Сред продаж в день: **{avg_per_day:.1f}**")
+            lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
             lines.append(f"   Макс продаж за день: **{max(day_counts.values())}**")
 
             channel = profit_channel if profit > 0 else review_channel
-            await channel.send(content="\n".join(lines), view=LinkButton(title=title))
+            await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
             if profit > 0 and liquid:
-                await liquid_profit_channel.send(content="\n".join(lines), view=LinkButton(title=title))
-            await asyncio.sleep(0.5)
-
-        await asyncio.sleep(5)
+                await liquid_profit_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
+    client.add_view(TargetsControlView())
+    client.add_view(OffersControlView())
+
+    my_targets_channel = client.get_channel(MY_TARGETS_CHANNEL_ID)
+    if my_targets_channel:
+        async for msg in my_targets_channel.history(limit=2):
+            if msg.author == client.user and msg.content == "🎯 **Управление таргетами**":
+                await msg.delete()
+                break
+        await my_targets_channel.send("🎯 **Управление таргетами**", view=TargetsControlView())
+
+    my_offers_channel = client.get_channel(MY_OFFERS_CHANNEL_ID)
+    if my_offers_channel:
+        async for msg in my_offers_channel.history(limit=2):
+            if msg.author == client.user and msg.content == "📦 **Мои офферы**":
+                await msg.delete()
+                break
+        await my_offers_channel.send("📦 **Мои офферы**", view=OffersControlView())
+
     asyncio.ensure_future(scan_loop())
+
+
+def format_targets(items: list) -> str:
+    if not items:
+        return "Нет таргетов."
+    lines = []
+    for t in items:
+        price = int(t.get("priceCents", 0)) / 100
+        status = t.get("status", "")
+        status_emoji = "🟢" if status == "TARGET_STATUS_ACTIVE" else "🔴"
+        lines.append(f"{status_emoji} **{t.get('title')}** — **${price:.2f}**")
+    return "\n".join(lines)
+
+
+def format_offers(items: list) -> str:
+    if not items:
+        return "Нет активных офферов."
+    lines = []
+    for item in items:
+        title = item.get("Title", "N/A")
+        offer = item.get("Offer") or {}
+        price = offer.get("Price", {}).get("Amount", 0)
+        lines.append(f"🟡 **{title}** — **${price:.2f}**")
+    return "\n".join(lines)
 
 
 @client.event
 async def on_message(message):
     if message.author == client.user:
         return
+
     if message.content == "!стоп":
         await message.channel.send("⏹ Остановлен")
         await client.close()

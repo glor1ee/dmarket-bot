@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales_raw, place_target, delete_target, get_user_targets, get_user_offers
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers
 from embed import target_embed, my_targets_embed
 
 load_dotenv()
@@ -187,7 +187,7 @@ async def scan_loop():
             if net < 1 or net > 10:
                 continue
 
-            sales = await asyncio.to_thread(get_last_sales_raw, title, 10)
+            sales = await asyncio.to_thread(get_last_sales, title, 10)
             if not sales:
                 continue
 
@@ -197,7 +197,6 @@ async def scan_loop():
                 day_counts[day] += 1
 
             liquid = any(count > 3 for count in day_counts.values())
-            
 
             offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
             target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]

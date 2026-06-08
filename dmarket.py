@@ -79,6 +79,20 @@ def get_user_offers() -> list:
         return []
 
 
+def get_balance() -> float | None:
+    try:
+        r = requests.get(
+            f"{BASE_URL}/account/v1/balance",
+            headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return None
+        return int(r.json().get("usd", 0)) / 100
+    except Exception:
+        return None
+
+
 def get_user_inventory() -> list:
     url = f"{BASE_URL}/marketplace-api/v2/user/inventory"
     all_items = []

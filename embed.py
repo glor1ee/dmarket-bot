@@ -1,12 +1,23 @@
 import discord
 
 
-def inventory_embed(items: list) -> discord.Embed:
+def rebid_embed(title: str, old_price: float, new_price: float, net: float) -> discord.Embed:
+    embed = discord.Embed(title="🔄 Авто-перебивка", color=discord.Color.orange())
+    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+    embed.add_field(name="Было", value=f"**${old_price:.2f}**", inline=True)
+    embed.add_field(name="Стало", value=f"**${new_price:.2f}**", inline=True)
+    embed.add_field(name="Net", value=f"**${net:.2f}**", inline=True)
+    return embed
+
+
+def inventory_embed(items: list, balance: float | None = None) -> discord.Embed:
     on_market = [i for i in items if i.get("inMarket")]
     embed = discord.Embed(
         title=f"На маркете: {len(on_market)}",
         color=discord.Color.green(),
     )
+    if balance is not None:
+        embed.add_field(name="💰 Баланс", value=f"**${balance:.2f}**", inline=False)
     if not on_market:
         embed.description = "Ничего не выставлено."
         return embed
@@ -15,7 +26,7 @@ def inventory_embed(items: list) -> discord.Embed:
         attr = item.get("attributes", {})
         price = float(item.get("offerRecommendedPrice", {}).get("Amount", 0))
         lines.append(f"🟢 **{attr.get('title')}** — **${price:.2f}**")
-    embed.description = "\n".join(lines)
+    embed.add_field(name="🎒 Предметы", value="\n".join(lines), inline=False)
     return embed
 
 

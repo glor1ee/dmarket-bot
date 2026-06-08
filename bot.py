@@ -7,8 +7,8 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory
-from embed import target_embed, my_targets_embed, inventory_embed
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance
+from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -20,6 +20,7 @@ LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
 MY_INVENTORY_CHANNEL_ID = 1513469237308559410
 MY_TARGETS_CHANNEL_ID = 1513236279905616054
 MY_OFFERS_CHANNEL_ID = 1513236353251414186
+TARTGET_UPDATE_CHANNEL_ID = 1513236453138890762
 TARTGETS_CHANNEL_ID = 1513234981269278750
 
 intents = discord.Intents.default()
@@ -76,6 +77,26 @@ class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"
                 )
         else:
             await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
+
+
+class LinkOnlyView(discord.ui.View):
+    def __init__(self, title: str, placed_price: float | None = None):
+        super().__init__(timeout=None)
+        url = (
+            "https://dmarket.com/ingame-items/item-list/csgo-skins"
+            f"?title={requests.utils.quote(title)}"
+        )
+        self.add_item(discord.ui.Button(
+            label="🔗 Открыть на DMarket",
+            url=url,
+            style=discord.ButtonStyle.link,
+        ))
+        if placed_price is not None:
+            self.add_item(discord.ui.Button(
+                label=f"🎯 Таргет поставлен: ${placed_price:.2f}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            ))
 
 
 class LinkButton(discord.ui.View):
@@ -161,8 +182,11 @@ class InventoryControlView(discord.ui.View):
     @discord.ui.button(label="🎒 Инвентарь", style=discord.ButtonStyle.secondary, custom_id="inventory_all")
     async def show_inventory(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        items = await asyncio.to_thread(get_user_inventory)
-        await interaction.followup.send(embed=inventory_embed(items), ephemeral=True)
+        items, balance = await asyncio.gather(
+            asyncio.to_thread(get_user_inventory),
+            asyncio.to_thread(get_balance),
+        )
+        await interaction.followup.send(embed=inventory_embed(items, balance), ephemeral=True)
 
 
 async def scan_loop():
@@ -200,7 +224,7 @@ async def scan_loop():
             if min_offer is None or max_target is None or max_target == 0:
                 continue
 
-            net = min_offer * 0.93 - max_target
+            net = min_offer * 0.90 - max_target
             if net < 1 or net > 10:
                 continue
 
@@ -222,7 +246,7 @@ async def scan_loop():
             if avg_offer is None:
                 continue
 
-            profit = avg_offer * 0.93 - max_target
+            profit = avg_offer * 0.90 - max_target
             emoji = "🟢" if profit > 0 else "🔴"
 
             lines = [
@@ -242,7 +266,7 @@ async def scan_loop():
                 lines.append(f"   Макс таргет: **${max(target_prices):.2f}**")
 
             avg_per_day = sum(day_counts.values()) / len(day_counts)
-            lines.append(f"   Прибыль (сред−7%−таргет): **${profit:.2f}**")
+            lines.append(f"   Прибыль (сред−10%−таргет): **${profit:.2f}**")
             lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
             lines.append(f"   Макс продаж за день: **{max(day_counts.values())}**")
 
@@ -250,7 +274,65 @@ async def scan_loop():
             await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
             if profit > 0 and liquid:
-                await liquid_profit_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
+                auto_price = round(max_target + 0.02, 2)
+                balance = await asyncio.to_thread(get_balance)
+                within_limit = balance is not None and auto_price <= balance * 0.60
+
+                if within_limit:
+                    ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
+                    placed = auto_price if (ok and new_id) else None
+                else:
+                    ok, placed, new_id = False, None, None
+
+                liquid_view = LinkButton(title=title, max_target=max_target) if not within_limit else LinkOnlyView(title=title, placed_price=placed)
+                await liquid_profit_channel.send(content="\n".join(lines), view=liquid_view)
+
+                if placed and new_id:
+                    targets_channel = client.get_channel(TARTGETS_CHANNEL_ID)
+                    if targets_channel:
+                        await targets_channel.send(
+                            embed=target_embed(title, auto_price, client.user),
+                            view=DeleteTargetView(target_id=new_id),
+                        )
+
+
+async def rebid_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(905)  
+        active = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_ACTIVE")
+        for t in active:
+            title = t.get("title", "")
+            my_price = int(t.get("priceCents", 0)) / 100
+            target_id = t.get("id") or t.get("targetId") or t.get("TargetID")
+            if not title or not target_id:
+                continue
+
+            min_offer, max_target = await asyncio.to_thread(get_aggregated_prices, title)
+            if min_offer is None or max_target is None or max_target == 0:
+                continue
+
+            if max_target <= my_price:
+                continue  # меня не перебили
+
+            net = min_offer * 0.90 - max_target
+            if net < 1 or net > 10:
+                await asyncio.to_thread(delete_target, target_id)
+                continue # уже не выгодно перебивать
+
+            new_price = round(max_target + 0.02, 2)
+            ok_del, _ = await asyncio.to_thread(delete_target, target_id)
+            if not ok_del:
+                continue
+
+            ok_place, _, new_id = await asyncio.to_thread(place_target, title, new_price)
+            if ok_place and new_id:
+                channel = client.get_channel(TARTGET_UPDATE_CHANNEL_ID)
+                if channel:
+                    await channel.send(
+                        embed=rebid_embed(title, my_price, new_price, net),
+                        view=DeleteTargetView(target_id=new_id),
+                    )
 
 
 @client.event
@@ -278,13 +360,18 @@ async def on_ready():
 
     my_inventory_channel = client.get_channel(MY_INVENTORY_CHANNEL_ID)
     if my_inventory_channel:
-        async for msg in my_inventory_channel.history(limit=2):
-            if msg.author == client.user and msg.content == "🎒 **Инвентарь**":
+        async for msg in my_inventory_channel.history(limit=10):
+            if msg.author == client.user:
                 await msg.delete()
-                break
         await my_inventory_channel.send("🎒 **Инвентарь**", view=InventoryControlView())
+        items, balance = await asyncio.gather(
+            asyncio.to_thread(get_user_inventory),
+            asyncio.to_thread(get_balance),
+        )
+        await my_inventory_channel.send(embed=inventory_embed(items, balance))
 
     asyncio.ensure_future(scan_loop())
+    asyncio.ensure_future(rebid_loop())
 
 
 def format_targets(items: list) -> str:
@@ -306,8 +393,14 @@ def format_offers(items: list) -> str:
     for item in items:
         title = item.get("Title", "N/A")
         offer = item.get("Offer") or {}
-        price = offer.get("Price", {}).get("Amount", 0)
-        lines.append(f"🟡 **{title}** — **${price:.2f}**")
+        price = float(offer.get("Price", {}).get("Amount", 0))
+        fee_raw = offer.get("Fee")
+        if fee_raw is not None:
+            fee = float(fee_raw.get("Amount", 0)) if isinstance(fee_raw, dict) else float(fee_raw)
+            net = price - fee
+        else:
+            net = price * 0.90
+        lines.append(f"🟡 **{title}** — **${price:.2f}** → чистыми **${net:.2f}**")
     return "\n".join(lines)
 
 

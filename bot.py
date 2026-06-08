@@ -7,8 +7,8 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers
-from embed import target_embed, my_targets_embed
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory
+from embed import target_embed, my_targets_embed, inventory_embed
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -17,6 +17,7 @@ PROFIT_CHANNEL_ID = 1511801054918869196
 REVIEW_CHANNEL_ID = 1511801444825698404
 LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
 
+MY_INVENTORY_CHANNEL_ID = 1513469237308559410
 MY_TARGETS_CHANNEL_ID = 1513236279905616054
 MY_OFFERS_CHANNEL_ID = 1513236353251414186
 TARTGETS_CHANNEL_ID = 1513234981269278750
@@ -153,14 +154,30 @@ class OffersControlView(discord.ui.View):
         await interaction.followup.send(f"📦 Офферы ({len(items)}):\n{format_offers(items)}", ephemeral=True)
 
 
+class InventoryControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎒 Инвентарь", style=discord.ButtonStyle.secondary, custom_id="inventory_all")
+    async def show_inventory(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        items = await asyncio.to_thread(get_user_inventory)
+        await interaction.followup.send(embed=inventory_embed(items), ephemeral=True)
+
+
 async def scan_loop():
     await client.wait_until_ready()
     profit_channel = client.get_channel(PROFIT_CHANNEL_ID)
     review_channel = client.get_channel(REVIEW_CHANNEL_ID)
     liquid_profit_channel = client.get_channel(LIQUID_PROFIT_CHANNEL_ID)
     seen: set[str] = set()
+    seen_reset_at = asyncio.get_event_loop().time()
 
     while not client.is_closed():
+        if asyncio.get_event_loop().time() - seen_reset_at >= 7200:
+            seen.clear()
+            seen_reset_at = asyncio.get_event_loop().time()
+            print("♻️ seen сброшен")
         try:
             skins = await asyncio.to_thread(get_recommended_skins)
         except Exception as e:
@@ -196,7 +213,7 @@ async def scan_loop():
                 day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
                 day_counts[day] += 1
 
-            liquid = any(count > 3 for count in day_counts.values())
+            liquid = any(count >= 3 for count in day_counts.values())
 
             offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
             target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
@@ -241,6 +258,7 @@ async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
     client.add_view(TargetsControlView())
     client.add_view(OffersControlView())
+    client.add_view(InventoryControlView())
 
     my_targets_channel = client.get_channel(MY_TARGETS_CHANNEL_ID)
     if my_targets_channel:
@@ -257,6 +275,14 @@ async def on_ready():
                 await msg.delete()
                 break
         await my_offers_channel.send("📦 **Мои офферы**", view=OffersControlView())
+
+    my_inventory_channel = client.get_channel(MY_INVENTORY_CHANNEL_ID)
+    if my_inventory_channel:
+        async for msg in my_inventory_channel.history(limit=2):
+            if msg.author == client.user and msg.content == "🎒 **Инвентарь**":
+                await msg.delete()
+                break
+        await my_inventory_channel.send("🎒 **Инвентарь**", view=InventoryControlView())
 
     asyncio.ensure_future(scan_loop())
 

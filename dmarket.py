@@ -79,6 +79,28 @@ def get_user_offers() -> list:
         return []
 
 
+def get_user_inventory() -> list:
+    url = f"{BASE_URL}/marketplace-api/v2/user/inventory"
+    all_items = []
+    cursor = ""
+    while True:
+        params = {"gameId": GAME_ID, "limit": "100", "currency": "USD"}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = requests.get(url, params=params, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            all_items.extend(data.get("items", []))
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+        except Exception:
+            break
+    return all_items
+
+
 def get_user_targets(status_filter: str | None = None) -> list:
     url = f"{BASE_URL}/marketplace-api/v2/user/targets"
     params = {"gameId": GAME_ID, "limit": "100"}

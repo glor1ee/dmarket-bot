@@ -1,6 +1,24 @@
 import discord
 
 
+def inventory_embed(items: list) -> discord.Embed:
+    on_market = [i for i in items if i.get("inMarket")]
+    embed = discord.Embed(
+        title=f"На маркете: {len(on_market)}",
+        color=discord.Color.green(),
+    )
+    if not on_market:
+        embed.description = "Ничего не выставлено."
+        return embed
+    lines = []
+    for item in on_market:
+        attr = item.get("attributes", {})
+        price = float(item.get("offerRecommendedPrice", {}).get("Amount", 0))
+        lines.append(f"🟢 **{attr.get('title')}** — **${price:.2f}**")
+    embed.description = "\n".join(lines)
+    return embed
+
+
 def my_targets_embed(items: list, kind: str = "all") -> discord.Embed:
     configs = {
         "all":      ("📋 Все таргеты",        discord.Color.blurple()),
@@ -8,7 +26,7 @@ def my_targets_embed(items: list, kind: str = "all") -> discord.Embed:
         "inactive": ("Неактивные таргеты", discord.Color.red()),
     }
     title_prefix, color = configs.get(kind, configs["all"])
-    embed = discord.Embed(title=f"{title_prefix} ({len(items)})", color=color)
+    embed = discord.Embed(title=f"{title_prefix}: {len(items)}", color=color)
     if not items:
         embed.description = "Нет таргетов."
     else:

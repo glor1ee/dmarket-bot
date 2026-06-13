@@ -1,11 +1,19 @@
-import time as _time
 import requests
 import os
 from dotenv import load_dotenv
 from auth import BASE_URL, GAME_ID, generate_headers
+import store
 
 load_dotenv()
 _JWT = os.getenv("DMARKET_JWT", "").strip()
+
+
+def _log_fail(where: str, resp=None, exc: Exception | None = None) -> None:
+    """Не глотаем ошибки молча: пишем в консоль статус/исключение."""
+    if exc is not None:
+        print(f"⚠️ {where}: {type(exc).__name__}: {exc}")
+    elif resp is not None:
+        print(f"⚠️ {where}: HTTP {resp.status_code}: {resp.text[:600]}")
 
 _SORT_OPTIONS = [
     ("price", "asc"),
@@ -156,9 +164,18 @@ def place_target(title: str, price_usd: float) -> tuple[bool, str, str | None]:
             result = r.json().get("Result", [])
             if result and result[0].get("Successful"):
                 target_id = result[0].get("TargetID")
+                store.record_buy_price(title, price_usd)
                 return True, "", target_id
+            # HTTP 200, но не Successful — вытаскиваем реальную причину
+            reason = ""
+            if result:
+                reason = result[0].get("Error") or result[0].get("Message") or ""
+            _log_fail("place_target", r)
+            return False, (reason or r.text[:300]), None
+        _log_fail("place_target", r)
         return False, r.text[:300], None
     except Exception as e:
+        _log_fail("place_target", exc=e)
         return False, str(e), None
 
 
@@ -176,9 +193,58 @@ def delete_target(target_id: str) -> tuple[bool, str]:
         r = requests.post(url, data=body_str, headers=headers, timeout=10)
         if r.status_code == 200:
             return True, ""
+        _log_fail("delete_target", r)
         return False, r.text[:300]
     except Exception as e:
+        _log_fail("delete_target", exc=e)
         return False, str(e)
+
+
+def _post_offer_batch(url: str, body: dict, where: str) -> tuple[bool, str, str | None]:
+    """Общий POST для v2 offers:batchCreate / batchUpdate.
+
+    Оба отвечают 200 с {"offers":[...], "failed":[{"code","message",...}]}.
+    Возвращает (ok, err, offer_id)."""
+    import json
+    headers = {
+        "Authorization": _JWT,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        r = requests.post(url, data=json.dumps(body, separators=(",", ":")), headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            failed = data.get("failed") or []
+            if failed:
+                f0 = failed[0]
+                err = f0.get("code") or "failed"
+                if f0.get("message"):
+                    err += f": {f0['message']}"
+                _log_fail(where, r)
+                return False, err, None
+            offers = data.get("offers") or []
+            new_id = offers[0].get("offerId") if offers else None
+            return True, "", new_id
+        _log_fail(where, r)
+        return False, r.text[:300], None
+    except Exception as e:
+        _log_fail(where, exc=e)
+        return False, str(e), None
+
+
+def create_offer(asset_id: str, price_cents: int) -> tuple[bool, str, str | None]:
+    """Выставляет предмет на продажу (v2 batchCreate). price в центах."""
+    url = f"{BASE_URL}/marketplace-api/v2/offers:batchCreate"
+    body = {"requests": [{"assetId": asset_id, "priceCents": int(price_cents)}]}
+    return _post_offer_batch(url, body, "create_offer")
+
+
+def update_offer(offer_id: str, asset_id: str, price_cents: int) -> tuple[bool, str, str | None]:
+    """Меняет цену активного оффера (v2 batchUpdate). price в центах."""
+    url = f"{BASE_URL}/marketplace-api/v2/offers:batchUpdate"
+    body = {"requests": [{"offerId": offer_id, "assetId": asset_id, "priceCents": int(price_cents)}]}
+    return _post_offer_batch(url, body, "update_offer")
 
 
 def get_last_sales(exact_title: str, limit: int = 20) -> list:

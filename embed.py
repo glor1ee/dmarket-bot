@@ -10,6 +10,33 @@ def rebid_embed(title: str, old_price: float, new_price: float, net: float) -> d
     return embed
 
 
+def offer_update_embed(title: str, old_price: float, new_price: float, buy_price: float, net: float) -> discord.Embed:
+    embed = discord.Embed(title="📉 Цена оффера снижена", color=discord.Color.gold())
+    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+    embed.add_field(name="Было", value=f"**${old_price:.2f}**", inline=True)
+    embed.add_field(name="Стало", value=f"**${new_price:.2f}**", inline=True)
+    embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+    embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
+    return embed
+
+
+def offer_create_embed(title: str, price: float, buy_price: float, net: float) -> discord.Embed:
+    embed = discord.Embed(title="🆕 Оффер выставлен", color=discord.Color.green())
+    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+    embed.add_field(name="Цена", value=f"**${price:.2f}**", inline=True)
+    embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+    embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
+    return embed
+
+
+def offer_create_no_buy_embed(title: str, price: float) -> discord.Embed:
+    embed = discord.Embed(title="🆕 Оффер выставлен (цена покупки неизвестна)", color=discord.Color.yellow())
+    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+    embed.add_field(name="Цена", value=f"**${price:.2f}**", inline=True)
+    embed.add_field(name="Чистыми", value=f"**${price * 0.90:.2f}**", inline=True)
+    return embed
+
+
 def inventory_embed(items: list, balance: float | None = None) -> discord.Embed:
     on_market = [i for i in items if i.get("inMarket")]
     embed = discord.Embed(

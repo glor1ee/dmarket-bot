@@ -1,5 +1,6 @@
 import discord
 import os
+import re
 import asyncio
 import requests.utils
 from collections import Counter
@@ -7,8 +8,9 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance
-from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer
+from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed
+from store import get_buy_price
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -21,7 +23,12 @@ MY_INVENTORY_CHANNEL_ID = 1513469237308559410
 MY_TARGETS_CHANNEL_ID = 1513236279905616054
 MY_OFFERS_CHANNEL_ID = 1513236353251414186
 TARTGET_UPDATE_CHANNEL_ID = 1513236453138890762
+OFFER_UPDATE_CHANNEL_ID = 1515027974301290616
 TARTGETS_CHANNEL_ID = 1513234981269278750
+
+# Депонированные на DMarket предметы имеют UUID в attributes.id (Steam-предметы — нет).
+# Только для них доступен batchCreate/batchUpdate.
+DEPOSITED_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -206,6 +213,7 @@ async def scan_loop():
             skins = await asyncio.to_thread(get_recommended_skins)
         except Exception as e:
             print(f"Ошибка: {e}")
+            await asyncio.sleep(30)
             continue
 
         for item in skins:
@@ -273,12 +281,13 @@ async def scan_loop():
             channel = profit_channel if profit > 0 else review_channel
             await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
-            if profit > 0 and liquid:
+            more_offers_than_targets = len(offer_prices) > len(target_prices)
+            if profit > 0 and liquid and more_offers_than_targets:
                 auto_price = round(max_target + 0.02, 2)
                 balance = await asyncio.to_thread(get_balance)
                 within_limit = balance is not None and auto_price <= balance * 0.60
 
-                if within_limit:
+                if within_limit and min_offer > 6:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
                     placed = auto_price if (ok and new_id) else None
                 else:
@@ -294,6 +303,8 @@ async def scan_loop():
                             embed=target_embed(title, auto_price, client.user),
                             view=DeleteTargetView(target_id=new_id),
                         )
+
+
 
 
 async def rebid_loop():
@@ -325,7 +336,7 @@ async def rebid_loop():
             if not ok_del:
                 continue
 
-            ok_place, _, new_id = await asyncio.to_thread(place_target, title, new_price)
+            ok_place, place_err, new_id = await asyncio.to_thread(place_target, title, new_price)
             if ok_place and new_id:
                 channel = client.get_channel(TARTGET_UPDATE_CHANNEL_ID)
                 if channel:
@@ -333,6 +344,112 @@ async def rebid_loop():
                         embed=rebid_embed(title, my_price, new_price, net),
                         view=DeleteTargetView(target_id=new_id),
                     )
+            else:
+                print(f"⚠️ rebid: '{title}' новый таргет (${new_price:.2f}) не встал после ретраев: {place_err}")
+
+
+def _undercut_cents(min_offer: float) -> int:
+    """Цена для оффера: на 1 цент ниже минимального оффера на маркете."""
+    return int(round(min_offer * 100)) - 1
+
+
+async def _reprice_offer(channel, title, offer_id, asset_id, my_price):
+    """Снижает цену существующего оффера до min_offer−1¢, если выгодно."""
+    buy_price = get_buy_price(title)
+    if buy_price is None:
+        return  # неизвестна цена последнего таргета — не трогаем
+
+    min_offer, _ = await asyncio.to_thread(get_aggregated_prices, title)
+    if min_offer is None or min_offer <= 0:
+        return
+
+    # перебиваем только если кто-то дешевле меня (иначе сами себя занижаем)
+    if min_offer >= my_price:
+        return
+
+    price_cents = _undercut_cents(min_offer)
+    new_price = price_cents / 100
+    if new_price <= 0 or new_price >= my_price:
+        return
+
+    net = new_price * 0.90 - buy_price
+    if net <= 0:
+        return  # доход против последнего таргета отрицательный — не двигаем
+
+    ok, err, _ = await asyncio.to_thread(update_offer, offer_id, asset_id, price_cents)
+    if ok:
+        if channel:
+            await channel.send(embed=offer_update_embed(title, my_price, new_price, buy_price, net))
+    else:
+        print(f"⚠️ offer_update: '{title}': {err}")
+
+
+async def _list_unlisted(channel, title, asset_id):
+    """Выставляет незалистенный предмет на продажу по min_offer−1¢, если выгодно."""
+    buy_price = get_buy_price(title)
+    print("buy_price", buy_price)
+
+    min_offer, _ = await asyncio.to_thread(get_aggregated_prices, title)
+    if min_offer is None or min_offer <= 0.01:
+        print(f"⚠️ list_unlisted: '{title}': min_offer недоступен или слишком низкий")
+        return
+
+    price_cents = _undercut_cents(min_offer)
+    new_price = price_cents / 100
+    if new_price <= 0:
+        print(f"⚠️ list_unlisted: '{title}': некорректная цена для выставления: ${new_price:.2f}")
+        return
+
+    if buy_price is None:
+        ok, err, _ = await asyncio.to_thread(create_offer, asset_id, price_cents)
+        if ok:
+            if channel:
+                await channel.send(embed=offer_create_no_buy_embed(title, new_price))
+        else:
+            print(f"⚠️ offer_create: '{title}': {err}")
+        return
+
+    net = new_price * 0.90 - buy_price
+    if net <= 0:
+        return
+
+    ok, err, _ = await asyncio.to_thread(create_offer, asset_id, price_cents)
+    print("ok", ok, "err", err)
+    if ok:
+        if channel:
+            await channel.send(embed=offer_create_embed(title, new_price, buy_price, net))
+    else:
+        print(f"⚠️ offer_create: '{title}': {err}")
+
+
+async def offer_update_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(915)  # 15 минут
+        channel = client.get_channel(OFFER_UPDATE_CHANNEL_ID)
+
+        # 1) обновляем цены уже выставленных офферов
+        offers = await asyncio.to_thread(get_user_offers)
+        for offer in offers:
+            title = offer.get("Title", "")
+            off = offer.get("Offer") or {}
+            offer_id = off.get("OfferID")
+            asset_id = offer.get("AssetID")
+            my_price = float(off.get("Price", {}).get("Amount", 0) or 0)
+            if not title or not offer_id or not asset_id or my_price <= 0:
+                continue
+            await _reprice_offer(channel, title, offer_id, asset_id, my_price)
+
+        # 2) выставляем задепонированные, но ещё не выставленные предметы
+        inventory = await asyncio.to_thread(get_user_inventory)
+        for it in inventory:
+            if it.get("inMarket"):
+                attr = it.get("attributes", {})
+                asset_id = attr.get("id", "")
+                title = attr.get("title", "")
+                if not title or not DEPOSITED_RE.match(asset_id):
+                    continue  # Steam-предмет / не депонирован — batchCreate недоступен
+                await _list_unlisted(channel, title, asset_id)
 
 
 @client.event
@@ -372,6 +489,7 @@ async def on_ready():
 
     asyncio.ensure_future(scan_loop())
     asyncio.ensure_future(rebid_loop())
+    asyncio.ensure_future(offer_update_loop())
 
 
 def format_targets(items: list) -> str:

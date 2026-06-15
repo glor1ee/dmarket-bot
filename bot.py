@@ -642,7 +642,7 @@ def format_offers(items: list, balance: float | None = None, closed: list | None
     return "\n".join(lines)
 
 
-@client.eventЫ
+@client.event
 async def on_message(message):
     if message.author == client.user:
         return

@@ -139,6 +139,43 @@ def get_user_targets(status_filter: str | None = None) -> list:
         return []
 
 
+def get_closed_targets() -> list:
+    """Возвращает все закрытые (купленные) таргеты. Поддерживает пагинацию.
+
+    ВНИМАНИЕ: эндпоинт возвращает один и тот же курсор и те же записи на каждой
+    странице, поэтому останавливаемся, как только новых TargetID не приходит.
+    """
+    url = f"{BASE_URL}/marketplace-api/v1/user-targets/closed"
+    all_trades = []
+    seen_ids: set[str] = set()
+    cursor = ""
+    while True:
+        params = {"gameId": GAME_ID, "limit": "100"}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = requests.get(url, params=params, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                _log_fail("get_closed_targets", r)
+                break
+            data = r.json()
+            trades = data.get("Trades", [])
+            new = [t for t in trades if t.get("TargetID") not in seen_ids]
+            if not new:
+                break  # новых записей нет — конец (курсор не продвигается)
+            for t in new:
+                seen_ids.add(t.get("TargetID"))
+            all_trades.extend(new)
+            next_cursor = data.get("Cursor", "")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        except Exception as e:
+            _log_fail("get_closed_targets", exc=e)
+            break
+    return all_trades
+
+
 def place_target(title: str, price_usd: float) -> tuple[bool, str, str | None]:
     import json
     url = f"{BASE_URL}/marketplace-api/v1/user-targets/create"

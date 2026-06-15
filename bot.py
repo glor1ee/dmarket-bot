@@ -8,9 +8,9 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets
 from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed
-from store import get_buy_price
+from store import get_buy_price, sync_closed_targets
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -25,6 +25,10 @@ MY_OFFERS_CHANNEL_ID = 1513236353251414186
 TARTGET_UPDATE_CHANNEL_ID = 1513236453138890762
 OFFER_UPDATE_CHANNEL_ID = 1515027974301290616
 TARTGETS_CHANNEL_ID = 1513234981269278750
+CLOSED_TARGETS_CHANNEL_ID = 1516105280499224768
+
+# TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
+_synced_closed_ids: set[str] = set()
 
 # Депонированные на DMarket предметы имеют UUID в attributes.id (Steam-предметы — нет).
 # Только для них доступен batchCreate/batchUpdate.
@@ -196,6 +200,22 @@ class InventoryControlView(discord.ui.View):
         await interaction.followup.send(embed=inventory_embed(items, balance), ephemeral=True)
 
 
+MAX_SALE_GAP_DAYS = 2  # «нормальный» интервал между продажами, в днях
+MAX_LARGE_GAPS = 2     # сколько разрывов больше нормы допускаем 
+
+
+def _count_large_gaps(sales: list, max_gap_days: int = MAX_SALE_GAP_DAYS) -> int | None:
+    """Сколько разрывов между соседними продажами (и от последней до «сейчас»)
+    превышают max_gap_days дней. None — если данных о продажах нет."""
+    timestamps = sorted(int(s.get("date", 0)) for s in sales if s.get("date"))
+    if not timestamps:
+        return None
+    now = datetime.now(tz=KYIV).timestamp()
+    points = timestamps + [now]  # включаем «сейчас» — учитываем свежесть последней продажи
+    gap_limit = max_gap_days * 86400
+    return sum(1 for i in range(len(points) - 1) if points[i + 1] - points[i] > gap_limit)
+
+
 async def scan_loop():
     await client.wait_until_ready()
     profit_channel = client.get_channel(PROFIT_CHANNEL_ID)
@@ -245,7 +265,12 @@ async def scan_loop():
                 day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
                 day_counts[day] += 1
 
-            liquid = any(count >= 3 for count in day_counts.values())
+            large_gaps = _count_large_gaps(sales)
+            liquid = (
+                large_gaps is not None
+                and large_gaps <= MAX_LARGE_GAPS
+                and any(count >= 3 for count in day_counts.values())
+            )
 
             offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
             target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
@@ -287,7 +312,7 @@ async def scan_loop():
                 balance = await asyncio.to_thread(get_balance)
                 within_limit = balance is not None and auto_price <= balance * 0.60
 
-                if within_limit and min_offer > 6:
+                if within_limit and auto_price > 5:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
                     placed = auto_price if (ok and new_id) else None
                 else:
@@ -310,7 +335,24 @@ async def scan_loop():
 async def rebid_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        await asyncio.sleep(905)  
+        await asyncio.sleep(905)
+
+        # Новые закрытые (купленные) таргеты → пишем цену покупки в JSON + сигнал
+        all_closed = await asyncio.to_thread(get_closed_targets)
+        new_closed = [t for t in all_closed if t.get("TargetID", "") not in _synced_closed_ids]
+        if new_closed:
+            await asyncio.to_thread(sync_closed_targets, new_closed)
+            closed_channel = client.get_channel(CLOSED_TARGETS_CHANNEL_ID)
+            for t in new_closed:
+                _synced_closed_ids.add(t.get("TargetID", ""))
+                title = t.get("Title", "")
+                price = float(t.get("Price", {}).get("Amount", 0))
+                if closed_channel and title and price > 0:
+                    embed = discord.Embed(title="🛒 Куплен по таргету", color=discord.Color.green())
+                    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+                    embed.add_field(name="Цена покупки", value=f"**${price:.2f}**", inline=True)
+                    await closed_channel.send(embed=embed)
+
         active = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_ACTIVE")
         for t in active:
             title = t.get("title", "")
@@ -425,7 +467,7 @@ async def _list_unlisted(channel, title, asset_id):
 async def offer_update_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        await asyncio.sleep(915)  # 15 минут
+        await asyncio.sleep(905)  # 15 минут
         channel = client.get_channel(OFFER_UPDATE_CHANNEL_ID)
 
         # 1) обновляем цены уже выставленных офферов
@@ -454,7 +496,15 @@ async def offer_update_loop():
 
 @client.event
 async def on_ready():
+    global _synced_closed_ids
     print(f"✅ Бот запущен как {client.user}")
+
+    # Стартовая синхронизация цен покупки из закрытых таргетов
+    closed = await asyncio.to_thread(get_closed_targets)
+    count = await asyncio.to_thread(sync_closed_targets, closed)
+    _synced_closed_ids = {t.get("TargetID", "") for t in closed}
+    print(f"📥 Синхронизировано закрытых таргетов: {count}")
+
     client.add_view(TargetsControlView())
     client.add_view(OffersControlView())
     client.add_view(InventoryControlView())

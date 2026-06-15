@@ -1,7 +1,9 @@
-"""Простое хранилище cost-basis: title -> цена таргета, по которой куплен скин.
+"""Хранилище buy-price: title -> цена покупки скина (в USD).
 
-DMarket не отдаёт цену покупки в оффере, поэтому запоминаем цену таргета
-в момент его постановки. При обновлении офферов читаем её для проверки дохода.
+Источник истины — закрытые таргеты (sync_closed_targets): когда таргет
+закрывается, скин куплен по цене таргета. Дополнительно при постановке
+таргета пишем оценочную цену (record_buy_price). get_buy_price читает
+актуальное значение для проверки дохода при авто-занижении офферов.
 """
 import json
 import os
@@ -19,17 +21,11 @@ def _read() -> dict:
         return {}
 
 
-def record_buy_price(title: str, price: float) -> None:
-    """Запомнить цену таргета для скина (перезаписывает прошлую)."""
-    if not title:
-        return
-    with _lock:
-        data = _read()
-        data[title] = round(float(price), 2)
-        tmp = _PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _PATH)
+def _write(data: dict) -> None:
+    tmp = _PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _PATH)
 
 
 def get_buy_price(title: str) -> float | None:
@@ -37,3 +33,33 @@ def get_buy_price(title: str) -> float | None:
     with _lock:
         val = _read().get(title)
     return float(val) if val is not None else None
+
+
+def record_buy_price(title: str, price: float) -> None:
+    """Записать оценочную цену покупки (в момент постановки таргета)."""
+    if not title:
+        return
+    with _lock:
+        data = _read()
+        data[title] = round(float(price), 2)
+        _write(data)
+
+
+def sync_closed_targets(trades: list) -> int:
+    """Записывает цену покупки из закрытых таргетов в JSON.
+    Сортируем по времени закрытия — последняя покупка перезаписывает прошлую.
+    Возвращает количество обновлённых записей."""
+    if not trades:
+        return 0
+    sorted_trades = sorted(trades, key=lambda t: int(t.get("ClosedAt", 0)))
+    with _lock:
+        data = _read()
+        count = 0
+        for t in sorted_trades:
+            title = t.get("Title", "")
+            price = float(t.get("Price", {}).get("Amount", 0))
+            if title and price > 0:
+                data[title] = round(price, 2)
+                count += 1
+        _write(data)
+    return count

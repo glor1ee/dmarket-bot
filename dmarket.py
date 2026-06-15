@@ -73,6 +73,39 @@ def get_aggregated_prices(title: str) -> tuple[float | None, float | None]:
         return None, None
 
 
+def get_market_offers(title: str, limit: int = 50) -> list:
+    """Офферы по конкретному скину, отсортированы по цене ↑ (HMAC).
+    Возвращает [(price_usd, offer_id), ...] — для поиска минимума среди чужих.
+
+    ВАЖНО: фильтр title= в API подстроночный (ловит и StatTrak™-вариант),
+    поэтому оставляем только объекты с ТОЧНЫМ совпадением title."""
+    from urllib.parse import quote
+    path = "/exchange/v1/market/items"
+    params = (
+        f"?side=market&orderBy=price&orderDir=asc"
+        f"&title={quote(title)}&priceFrom=0&priceTo=0"
+        f"&treeFilters=&gameId={GAME_ID}&types=dmarket&myFavorites=false"
+        f"&cursor=&limit={limit}&currency=USD&platform=browser&isLoggedIn=true"
+    )
+    try:
+        r = requests.get(BASE_URL + path + params, headers=generate_headers("GET", path + params), timeout=10)
+        if r.status_code != 200:
+            _log_fail("get_market_offers", r)
+            return []
+        result = []
+        for o in r.json().get("objects", []):
+            if o.get("title") != title:
+                continue  # подстроночный матч API — отсекаем чужие title
+            price = int(o.get("price", {}).get("USD", 0)) / 100
+            offer_id = (o.get("extra") or {}).get("offerId")
+            if price > 0 and offer_id:
+                result.append((price, offer_id))
+        return result
+    except Exception as e:
+        _log_fail("get_market_offers", exc=e)
+        return []
+
+
 def get_user_offers() -> list:
     url = f"{BASE_URL}/marketplace-api/v1/user-offers"
     params = {"gameId": GAME_ID, "limit": "100", "currency": "USD"}
@@ -84,6 +117,19 @@ def get_user_offers() -> list:
         return r.json().get("Items", [])
     except Exception:
         return []
+
+
+def jwt_is_valid() -> bool:
+    """Проверяет JWT лёгким запросом баланса. True — токен живой, False — 401/ошибка."""
+    try:
+        r = requests.get(
+            f"{BASE_URL}/account/v1/balance",
+            headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 def get_balance() -> float | None:
@@ -98,6 +144,26 @@ def get_balance() -> float | None:
         return int(r.json().get("usd", 0)) / 100
     except Exception:
         return None
+
+
+def get_customized_fees() -> dict:
+    """Таблица комиссий на продажу: {defaultFee, reducedFees}. {} при ошибке.
+    reducedFees ~12.5к позиций (~2 МБ), отдаётся одним ответом без пагинации."""
+    url = f"{BASE_URL}/exchange/v1/customized-fees"
+    try:
+        r = requests.get(
+            url,
+            params={"gameId": GAME_ID, "limit": "100000"},
+            headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            _log_fail("get_customized_fees", r)
+            return {}
+        return r.json()
+    except Exception as e:
+        _log_fail("get_customized_fees", exc=e)
+        return {}
 
 
 def get_user_inventory() -> list:
@@ -171,6 +237,43 @@ def get_closed_targets() -> list:
             cursor = next_cursor
         except Exception as e:
             _log_fail("get_closed_targets", exc=e)
+            break
+    return all_trades
+
+
+def get_closed_offers() -> list:
+    """Возвращает все закрытые офферы (мои продажи). Та же защита от не-продвигающегося
+    курсора, что и в get_closed_targets — дедуп по OfferID.
+
+    У каждой записи есть фактический Fee: {Amount: {Amount}, Percent} и Status
+    (successful / trade_protected)."""
+    url = f"{BASE_URL}/marketplace-api/v1/user-offers/closed"
+    all_trades = []
+    seen_ids: set[str] = set()
+    cursor = ""
+    while True:
+        params = {"gameId": GAME_ID, "limit": "100"}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = requests.get(url, params=params, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                _log_fail("get_closed_offers", r)
+                break
+            data = r.json()
+            trades = data.get("Trades", [])
+            new = [t for t in trades if t.get("OfferID") not in seen_ids]
+            if not new:
+                break
+            for t in new:
+                seen_ids.add(t.get("OfferID"))
+            all_trades.extend(new)
+            next_cursor = data.get("Cursor", "")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        except Exception as e:
+            _log_fail("get_closed_offers", exc=e)
             break
     return all_trades
 

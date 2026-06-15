@@ -8,9 +8,10 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets
-from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, jwt_is_valid, get_customized_fees, get_market_offers, get_closed_offers
+from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed, offer_sold_embed
 from store import get_buy_price, sync_closed_targets
+import fees
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,9 +27,12 @@ TARTGET_UPDATE_CHANNEL_ID = 1513236453138890762
 OFFER_UPDATE_CHANNEL_ID = 1515027974301290616
 TARTGETS_CHANNEL_ID = 1513234981269278750
 CLOSED_TARGETS_CHANNEL_ID = 1516105280499224768
+CLOSED_OFFERS_CHANNEL_ID = 1516208442967331039
 
 # TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
 _synced_closed_ids: set[str] = set()
+# OfferID закрытых офферов (продаж), уже обработанных (заполняется в on_ready).
+_synced_closed_offer_ids: set[str] = set()
 
 # Депонированные на DMarket предметы имеют UUID в attributes.id (Steam-предметы — нет).
 # Только для них доступен batchCreate/batchUpdate.
@@ -182,8 +186,15 @@ class OffersControlView(discord.ui.View):
     @discord.ui.button(label="📦 Мои офферы", style=discord.ButtonStyle.secondary, custom_id="offers_all")
     async def all_offers(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        items = await asyncio.to_thread(get_user_offers)
-        await interaction.followup.send(f"📦 Офферы ({len(items)}):\n{format_offers(items)}", ephemeral=True)
+        items, balance, closed = await asyncio.gather(
+            asyncio.to_thread(get_user_offers),
+            asyncio.to_thread(get_balance),
+            asyncio.to_thread(get_closed_offers),
+        )
+        await interaction.followup.send(
+            f"📦 Офферы ({len(items)}):\n{format_offers(items, balance, closed)}",
+            ephemeral=True,
+        )
 
 
 class InventoryControlView(discord.ui.View):
@@ -396,32 +407,35 @@ def _undercut_cents(min_offer: float) -> int:
 
 
 async def _reprice_offer(channel, title, offer_id, asset_id, my_price):
-    """Снижает цену существующего оффера до min_offer−1¢, если выгодно."""
+    """Подгоняет цену оффера под минимум среди чужих офферов (competitor−1¢):
+    вниз если меня перебили, вверх если я стою дешевле рынка. Только если выгодно."""
     buy_price = get_buy_price(title)
     if buy_price is None:
         return  # неизвестна цена последнего таргета — не трогаем
 
-    min_offer, _ = await asyncio.to_thread(get_aggregated_prices, title)
-    if min_offer is None or min_offer <= 0:
+    # минимальная цена среди чужих офферов (свой исключаем по offer_id)
+    offers = await asyncio.to_thread(get_market_offers, title)
+    competitor = next((p for p, oid in offers if oid != offer_id), None)
+    if competitor is None or competitor <= 0:
         return
 
-    # перебиваем только если кто-то дешевле меня (иначе сами себя занижаем)
-    if min_offer >= my_price:
-        return
-
-    price_cents = _undercut_cents(min_offer)
+    price_cents = _undercut_cents(competitor)
     new_price = price_cents / 100
-    if new_price <= 0 or new_price >= my_price:
+    if new_price <= 0 or new_price == my_price:
         return
 
-    net = new_price * 0.90 - buy_price
+    frac = fees.fee_fraction(title, new_price)
+    net = new_price * (1 - frac) - buy_price
     if net <= 0:
         return  # доход против последнего таргета отрицательный — не двигаем
 
     ok, err, _ = await asyncio.to_thread(update_offer, offer_id, asset_id, price_cents)
     if ok:
         if channel:
-            await channel.send(embed=offer_update_embed(title, my_price, new_price, buy_price, net))
+            await channel.send(embed=offer_update_embed(
+                title, my_price, new_price, buy_price, net, frac,
+                competitor=competitor, market=offers, my_offer_id=offer_id,
+            ))
     else:
         print(f"⚠️ offer_update: '{title}': {err}")
 
@@ -429,37 +443,35 @@ async def _reprice_offer(channel, title, offer_id, asset_id, my_price):
 async def _list_unlisted(channel, title, asset_id):
     """Выставляет незалистенный предмет на продажу по min_offer−1¢, если выгодно."""
     buy_price = get_buy_price(title)
-    print("buy_price", buy_price)
 
     min_offer, _ = await asyncio.to_thread(get_aggregated_prices, title)
     if min_offer is None or min_offer <= 0.01:
-        print(f"⚠️ list_unlisted: '{title}': min_offer недоступен или слишком низкий")
         return
 
     price_cents = _undercut_cents(min_offer)
     new_price = price_cents / 100
     if new_price <= 0:
-        print(f"⚠️ list_unlisted: '{title}': некорректная цена для выставления: ${new_price:.2f}")
         return
+
+    frac = fees.fee_fraction(title, new_price)
 
     if buy_price is None:
         ok, err, _ = await asyncio.to_thread(create_offer, asset_id, price_cents)
         if ok:
             if channel:
-                await channel.send(embed=offer_create_no_buy_embed(title, new_price))
+                await channel.send(embed=offer_create_no_buy_embed(title, new_price, new_price * (1 - frac), frac))
         else:
             print(f"⚠️ offer_create: '{title}': {err}")
         return
 
-    net = new_price * 0.90 - buy_price
+    net = new_price * (1 - frac) - buy_price
     if net <= 0:
         return
 
     ok, err, _ = await asyncio.to_thread(create_offer, asset_id, price_cents)
-    print("ok", ok, "err", err)
     if ok:
         if channel:
-            await channel.send(embed=offer_create_embed(title, new_price, buy_price, net))
+            await channel.send(embed=offer_create_embed(title, new_price, buy_price, net, frac))
     else:
         print(f"⚠️ offer_create: '{title}': {err}")
 
@@ -469,6 +481,31 @@ async def offer_update_loop():
     while not client.is_closed():
         await asyncio.sleep(905)  # 15 минут
         channel = client.get_channel(OFFER_UPDATE_CHANNEL_ID)
+
+        # Кэш комиссий обновляем не чаще раза в час (таблица большая, меняется редко)
+        if fees.is_stale():
+            count = fees.update(await asyncio.to_thread(get_customized_fees))
+            if count:
+                print(f"♻️ Кэш комиссий обновлён: {count} льготных")
+
+        # Новые закрытые офферы (продажи) → сигнал «💸 Скин продан» с фактической комиссией
+        all_closed = await asyncio.to_thread(get_closed_offers)
+        new_closed = [t for t in all_closed if t.get("OfferID", "") not in _synced_closed_offer_ids]
+        if new_closed:
+            sold_channel = client.get_channel(CLOSED_OFFERS_CHANNEL_ID)
+            for t in new_closed:
+                _synced_closed_offer_ids.add(t.get("OfferID", ""))
+                title = t.get("Title", "")
+                price = float(t.get("Price", {}).get("Amount", 0))
+                fee_obj = t.get("Fee") or {}
+                fee_amount = float((fee_obj.get("Amount") or {}).get("Amount", 0))
+                try:
+                    fee_percent = float(fee_obj.get("Percent", 0))
+                except (TypeError, ValueError):
+                    fee_percent = 0.0
+                net = price - fee_amount
+                if sold_channel and title and price > 0:
+                    await sold_channel.send(embed=offer_sold_embed(title, price, fee_amount, fee_percent, net, t.get("Status", "")))
 
         # 1) обновляем цены уже выставленных офферов
         offers = await asyncio.to_thread(get_user_offers)
@@ -496,14 +533,29 @@ async def offer_update_loop():
 
 @client.event
 async def on_ready():
-    global _synced_closed_ids
+    global _synced_closed_ids, _synced_closed_offer_ids
     print(f"✅ Бот запущен как {client.user}")
+
+    # Проверка JWT при старте — токен короткоживущий, протухает периодически
+    if await asyncio.to_thread(jwt_is_valid):
+        print("🔑 JWT валиден")
+    else:
+        print("🔑 ВНИМАНИЕ: JWT протух/невалиден (401). Обнови DMARKET_JWT в .env и перезапусти бота — приватные функции (офферы, таргеты, инвентарь) работать не будут.")
 
     # Стартовая синхронизация цен покупки из закрытых таргетов
     closed = await asyncio.to_thread(get_closed_targets)
     count = await asyncio.to_thread(sync_closed_targets, closed)
     _synced_closed_ids = {t.get("TargetID", "") for t in closed}
     print(f"📥 Синхронизировано закрытых таргетов: {count}")
+
+    # Запоминаем уже закрытые офферы (продажи), чтобы не слать сигналы по старым
+    closed_offers = await asyncio.to_thread(get_closed_offers)
+    _synced_closed_offer_ids = {t.get("OfferID", "") for t in closed_offers}
+    print(f"📥 Закрытых офферов (продаж) при старте: {len(_synced_closed_offer_ids)}")
+
+    # Кэш комиссий на продажу (для реального net в офферах)
+    fee_count = fees.update(await asyncio.to_thread(get_customized_fees))
+    print(f"📥 Загружено льготных комиссий: {fee_count}")
 
     client.add_view(TargetsControlView())
     client.add_view(OffersControlView())
@@ -554,25 +606,43 @@ def format_targets(items: list) -> str:
     return "\n".join(lines)
 
 
-def format_offers(items: list) -> str:
-    if not items:
-        return "Нет активных офферов."
+def _closed_offer_net(t: dict) -> float:
+    """Чистыми с закрытого оффера (продажи): Price − фактический Fee."""
+    price = float(t.get("Price", {}).get("Amount", 0))
+    fee = float(((t.get("Fee") or {}).get("Amount") or {}).get("Amount", 0))
+    return price - fee
+
+
+def format_offers(items: list, balance: float | None = None, closed: list | None = None) -> str:
     lines = []
-    for item in items:
-        title = item.get("Title", "N/A")
-        offer = item.get("Offer") or {}
-        price = float(offer.get("Price", {}).get("Amount", 0))
-        fee_raw = offer.get("Fee")
-        if fee_raw is not None:
-            fee = float(fee_raw.get("Amount", 0)) if isinstance(fee_raw, dict) else float(fee_raw)
-            net = price - fee
-        else:
-            net = price * 0.90
-        lines.append(f"🟡 **{title}** — **${price:.2f}** → чистыми **${net:.2f}**")
+    total_net = 0.0
+    if not items:
+        lines.append("Нет активных офферов.")
+    else:
+        total_price = 0.0
+        for item in items:
+            title = item.get("Title", "N/A")
+            offer = item.get("Offer") or {}
+            price = float(offer.get("Price", {}).get("Amount", 0))
+            frac = fees.fee_fraction(title, price)
+            net = price * (1 - frac)
+            total_price += price
+            total_net += net
+            lines.append(f"🟡 **{title}** — **${price:.2f}** → чистыми **${net:.2f}** (fee {frac * 100:.0f}%)")
+        lines.append("")
+        lines.append(f"💰 **Итого офферы:** **${total_price:.2f}** → чистыми **${total_net:.2f}**")
+
+    pending = sum(_closed_offer_net(t) for t in (closed or []) if t.get("Status") == "trade_protected")
+    if closed is not None:
+        lines.append(f"🔒 **На trade-protected:** **${pending:.2f}** (с продаж)")
+    if balance is not None:
+        lines.append(f"🏦 **Баланс:** **${balance:.2f}**")
+    if balance is not None and closed is not None:
+        lines.append(f"📊 **Всего ({total_net:.2f} + {pending:.2f} + {balance:.2f}):  ** **${total_net + pending + balance:.2f}**")
     return "\n".join(lines)
 
 
-@client.event
+@client.eventЫ
 async def on_message(message):
     if message.author == client.user:
         return

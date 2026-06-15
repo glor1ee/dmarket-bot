@@ -10,30 +10,61 @@ def rebid_embed(title: str, old_price: float, new_price: float, net: float) -> d
     return embed
 
 
-def offer_update_embed(title: str, old_price: float, new_price: float, buy_price: float, net: float) -> discord.Embed:
-    embed = discord.Embed(title="📉 Цена оффера снижена", color=discord.Color.gold())
+def offer_sold_embed(title: str, price: float, fee_amount: float, fee_percent: float, net: float, status: str) -> discord.Embed:
+    pending = status == "trade_protected"
+    embed = discord.Embed(
+        title="💸 Скин продан",
+        color=discord.Color.orange() if pending else discord.Color.green(),
+    )
     embed.add_field(name="Скин", value=f"**{title}**", inline=False)
-    embed.add_field(name="Было", value=f"**${old_price:.2f}**", inline=True)
-    embed.add_field(name="Стало", value=f"**${new_price:.2f}**", inline=True)
-    embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+    embed.add_field(name="Цена продажи", value=f"**${price:.2f}**", inline=True)
+    embed.add_field(name="Комиссия", value=f"**${fee_amount:.2f}** ({fee_percent * 100:.0f}%)", inline=True)
     embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
+    status_label = "🔒 Trade-protected (деньги в ожидании)" if pending else "✅ Завершена"
+    embed.add_field(name="Статус", value=status_label, inline=False)
     return embed
 
 
-def offer_create_embed(title: str, price: float, buy_price: float, net: float) -> discord.Embed:
+def offer_update_embed(title: str, old_price: float, new_price: float, buy_price: float, net: float, fee: float = 0.10,
+                       competitor: float | None = None, market: list | None = None, my_offer_id: str | None = None) -> discord.Embed:
+    if new_price > old_price:
+        head, color = "📈 Цена оффера поднята", discord.Color.green()
+    else:
+        head, color = "📉 Цена оффера снижена", discord.Color.gold()
+    embed = discord.Embed(title=head, color=color)
+    embed.add_field(name="Скин", value=f"**{title}**", inline=False)
+    embed.add_field(name="Было", value=f"**${old_price:.2f}**", inline=True)
+    embed.add_field(name="Стало", value=f"**${new_price:.2f}**", inline=True)
+    if competitor is not None:
+        embed.add_field(name="Мин. конкурент", value=f"**${competitor:.2f}**", inline=True)
+    embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+    embed.add_field(name="Комиссия", value=f"**{fee * 100:.0f}%**", inline=True)
+    embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
+    if market:
+        lines = []
+        for price, oid in market[:6]:
+            mark = "  ← мой" if oid == my_offer_id else ""
+            lines.append(f"${price:.2f}{mark}")
+        embed.add_field(name="Рынок (топ-6 ↑)", value="\n".join(lines), inline=False)
+    return embed
+
+
+def offer_create_embed(title: str, price: float, buy_price: float, net: float, fee: float = 0.10) -> discord.Embed:
     embed = discord.Embed(title="🆕 Оффер выставлен", color=discord.Color.green())
     embed.add_field(name="Скин", value=f"**{title}**", inline=False)
     embed.add_field(name="Цена", value=f"**${price:.2f}**", inline=True)
     embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+    embed.add_field(name="Комиссия", value=f"**{fee * 100:.0f}%**", inline=True)
     embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
     return embed
 
 
-def offer_create_no_buy_embed(title: str, price: float) -> discord.Embed:
+def offer_create_no_buy_embed(title: str, price: float, net: float, fee: float = 0.10) -> discord.Embed:
     embed = discord.Embed(title="🆕 Оффер выставлен (цена покупки неизвестна)", color=discord.Color.yellow())
     embed.add_field(name="Скин", value=f"**{title}**", inline=False)
     embed.add_field(name="Цена", value=f"**${price:.2f}**", inline=True)
-    embed.add_field(name="Чистыми", value=f"**${price * 0.90:.2f}**", inline=True)
+    embed.add_field(name="Комиссия", value=f"**{fee * 100:.0f}%**", inline=True)
+    embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
     return embed
 
 

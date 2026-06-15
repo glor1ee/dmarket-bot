@@ -2,7 +2,6 @@ import requests
 import os
 from dotenv import load_dotenv
 from auth import BASE_URL, GAME_ID, generate_headers
-import store
 
 load_dotenv()
 _JWT = os.getenv("DMARKET_JWT", "").strip()
@@ -201,7 +200,6 @@ def place_target(title: str, price_usd: float) -> tuple[bool, str, str | None]:
             result = r.json().get("Result", [])
             if result and result[0].get("Successful"):
                 target_id = result[0].get("TargetID")
-                store.record_buy_price(title, price_usd)
                 return True, "", target_id
             # HTTP 200, но не Successful — вытаскиваем реальную причину
             reason = ""

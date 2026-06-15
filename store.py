@@ -1,9 +1,7 @@
-"""Хранилище buy-price: title -> цена покупки скина (в USD).
+"""Хранилище buy-price: title -> цена покупки из закрытых таргетов (USD).
 
-Источник истины — закрытые таргеты (sync_closed_targets): когда таргет
-закрывается, скин куплен по цене таргета. Дополнительно при постановке
-таргета пишем оценочную цену (record_buy_price). get_buy_price читает
-актуальное значение для проверки дохода при авто-занижении офферов.
+Заполняется только из закрытых (купленных) таргетов — sync_closed_targets.
+get_buy_price читает значение для проверки дохода при авто-занижении офферов.
 """
 import json
 import os
@@ -33,16 +31,6 @@ def get_buy_price(title: str) -> float | None:
     with _lock:
         val = _read().get(title)
     return float(val) if val is not None else None
-
-
-def record_buy_price(title: str, price: float) -> None:
-    """Записать оценочную цену покупки (в момент постановки таргета)."""
-    if not title:
-        return
-    with _lock:
-        data = _read()
-        data[title] = round(float(price), 2)
-        _write(data)
 
 
 def sync_closed_targets(trades: list) -> int:

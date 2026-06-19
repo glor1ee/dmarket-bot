@@ -158,6 +158,35 @@ class LinkButton(discord.ui.View):
         await interaction.response.send_modal(PlaceTargetModal(skin_title=self.title))
 
 
+class SkinInfoView(discord.ui.View):
+    """Кнопка с актуальной информацией о скине (цены, последние продажи) + ссылка."""
+    def __init__(self, title: str):
+        super().__init__(timeout=None)
+        self.title = title
+        url = (
+            "https://dmarket.com/ingame-items/item-list/csgo-skins"
+            f"?title={requests.utils.quote(title)}"
+        )
+        self.add_item(discord.ui.Button(
+            label="🔗 Открыть на DMarket",
+            url=url,
+            style=discord.ButtonStyle.link,
+        ))
+
+    @discord.ui.button(label="ℹ️ Инфо о скине", style=discord.ButtonStyle.secondary)
+    async def info_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        (min_offer, max_target), sales = await asyncio.gather(
+            asyncio.to_thread(get_aggregated_prices, self.title),
+            asyncio.to_thread(get_last_sales, self.title, 30),
+        )
+        if not sales:
+            await interaction.followup.send(f"ℹ️ **{self.title}** — нет данных о продажах.", ephemeral=True)
+            return
+        info = build_skin_info(self.title, sales, min_offer, max_target, get_buy_price(self.title))
+        await interaction.followup.send("\n".join(info["lines"]), ephemeral=True)
+
+
 class TargetsControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -214,7 +243,7 @@ class InventoryControlView(discord.ui.View):
 
 
 MIN_OFFER_SALES = 12       # минимум продаж через офферы в выборке (из ~30)
-MIN_SALES_PER_DAY = 1      # минимальная скорость продаж-офферов в день
+MIN_SALES_PER_DAY = 0.5      # минимальная скорость продаж-офферов в день
 MAX_LAST_AGE_HOURS = 36    # не старше: часов с последней продажи
 
 
@@ -236,6 +265,61 @@ def liquidity_score(sales: list) -> dict:
     last_age_h = (now - ts[-1]) / 3600
     ok = rate >= MIN_SALES_PER_DAY and last_age_h <= MAX_LAST_AGE_HOURS
     return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales)}
+
+
+def build_skin_info(title: str, sales: list, min_offer: float | None = None,
+                    max_target: float | None = None, buy_price: float | None = None) -> dict:
+    """Инфо-блок о скине (строки + метрики) из УЖЕ полученных данных.
+
+    Сетевых вызовов нет — sales/цены передаёт вызывающий, поэтому переиспользование
+    в scan_loop не добавляет запросов. Возвращает {lines, liq, avg_offer, profit, net,
+    offer_prices, target_prices}; фильтры остаются на стороне вызывающего."""
+    day_counts = Counter()
+    for s in sales:
+        day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
+        day_counts[day] += 1
+
+    offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
+    target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
+    avg_offer = sum(offer_prices) / len(offer_prices) if offer_prices else None
+    liq = liquidity_score(sales)
+    net = (min_offer * 0.90 - max_target) if (min_offer is not None and max_target is not None) else None
+    profit = (avg_offer * 0.90 - max_target) if (avg_offer is not None and max_target is not None) else None
+
+    emoji = "🟢" if (profit is not None and profit > 0) else "🔴"
+    mo = f"${min_offer:.2f}" if min_offer is not None else "—"
+    mt = f"${max_target:.2f}" if max_target is not None else "—"
+    net_s = f"${net:.2f}" if net is not None else "—"
+    lines = [
+        f"{emoji} **{title}**",
+        f"   ОФФЕР: **{mo}** | ТАРГЕТ: **{mt}** | Прибыль: **{net_s}**",
+    ]
+    if buy_price is not None:
+        lines.append(f"   Цена покупки: **${buy_price:.2f}**")
+    for s in sales:
+        dt = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y %H:%M")
+        lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?'):<8} {dt}")
+    if offer_prices:
+        lines.append(f"   Макс оффер:  **${max(offer_prices):.2f}**")
+        lines.append(f"   Сред оффер:  **${avg_offer:.2f}**")
+    if target_prices:
+        lines.append(f"   Макс таргет: **${max(target_prices):.2f}**")
+    if profit is not None:
+        lines.append(f"   Прибыль (сред−10%−таргет): **${profit:.2f}**")
+    if day_counts:
+        avg_per_day = sum(day_counts.values()) / len(day_counts)
+        lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
+        lines.append(f"   Макс продаж за день: **{max(day_counts.values())}**")
+    lines.append(
+        f"   Ликвидность {'🟢' if liq['ok'] else '🔴'}: "
+        f"офферов **{liq['offers']}** | **{liq['rate']:.2f}/день** | "
+        f"свежесть **{liq['last_age_h']:.0f}ч** | выборка {liq['n']}"
+    )
+    return {
+        "lines": lines, "liq": liq, "avg_offer": avg_offer,
+        "profit": profit, "net": net,
+        "offer_prices": offer_prices, "target_prices": target_prices,
+    }
 
 
 async def scan_loop():
@@ -262,7 +346,7 @@ async def scan_loop():
             title = item.get("title", "N/A")
             price = int(item["price"].get("USD", 0)) / 100
 
-            if price > 100:
+            if price > 1000:
                 continue
 
             if title in seen:
@@ -282,49 +366,13 @@ async def scan_loop():
             if not sales:
                 continue
 
-            day_counts = Counter()
-            for s in sales:
-                day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
-                day_counts[day] += 1
-
-            liq = liquidity_score(sales)
-            liquid = liq["ok"]
-
-            offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
-            target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
-            avg_offer = sum(offer_prices) / len(offer_prices) if offer_prices else None
-
-            if avg_offer is None:
+            info = build_skin_info(title, sales, min_offer, max_target, get_buy_price(title))
+            if info["avg_offer"] is None:
                 continue
 
-            profit = avg_offer * 0.90 - max_target
-            emoji = "🟢" if profit > 0 else "🔴"
-
-            lines = [
-                f"{emoji} **{title}**",
-                f"   ОФФЕР: **${min_offer:.2f}** | ТАРГЕТ: **${max_target:.2f}** | Прибыль: **${net:.2f}**",
-            ]
-            for s in sales:
-                ts = int(s.get("date", 0))
-                dt = datetime.fromtimestamp(ts, tz=KYIV)
-                date_str = dt.strftime("%d %b %Y %H:%M")
-                lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?'):<8} {date_str}")
-
-            if offer_prices:
-                lines.append(f"   Макс оффер:  **${max(offer_prices):.2f}**")
-                lines.append(f"   Сред оффер:  **${avg_offer:.2f}**")
-            if target_prices:
-                lines.append(f"   Макс таргет: **${max(target_prices):.2f}**")
-
-            avg_per_day = sum(day_counts.values()) / len(day_counts)
-            lines.append(f"   Прибыль (сред−10%−таргет): **${profit:.2f}**")
-            lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
-            lines.append(f"   Макс продаж за день: **{max(day_counts.values())}**")
-            lines.append(
-                f"   Ликвидность {'🟢' if liquid else '🔴'}: "
-                f"офферов **{liq['offers']}** | **{liq['rate']:.2f}/день** | "
-                f"свежесть **{liq['last_age_h']:.0f}ч** | выборка {liq['n']}"
-            )
+            profit = info["profit"]
+            liquid = info["liq"]["ok"]
+            lines = info["lines"]
 
             channel = profit_channel if profit > 0 else review_channel
             await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
@@ -340,7 +388,12 @@ async def scan_loop():
                 else:
                     ok, placed, new_id = False, None, None
 
-                liquid_view = LinkButton(title=title, max_target=max_target) if not within_limit else LinkOnlyView(title=title, placed_price=placed)
+                # поставлен авто-таргет → только неактивная кнопка с ценой; иначе — рабочие кнопки
+                liquid_view = (
+                    LinkOnlyView(title=title, placed_price=placed)
+                    if placed
+                    else LinkButton(title=title, max_target=max_target)
+                )
                 await liquid_profit_channel.send(content="\n".join(lines), view=liquid_view)
 
                 if placed and new_id:
@@ -373,7 +426,7 @@ async def rebid_loop():
                     embed = discord.Embed(title="🛒 Куплен по таргету", color=discord.Color.green())
                     embed.add_field(name="Скин", value=f"**{title}**", inline=False)
                     embed.add_field(name="Цена покупки", value=f"**${price:.2f}**", inline=True)
-                    await closed_channel.send(embed=embed)
+                    await closed_channel.send(embed=embed, view=SkinInfoView(title=title))
 
         active = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_ACTIVE")
         for t in active:
@@ -513,8 +566,9 @@ async def offer_update_loop():
                 except (TypeError, ValueError):
                     fee_percent = 0.0
                 net = price - fee_amount
+                buy_price = get_buy_price(title)
                 if sold_channel and title and price > 0:
-                    await sold_channel.send(embed=offer_sold_embed(title, price, fee_amount, fee_percent, net, t.get("Status", "")))
+                    await sold_channel.send(embed=offer_sold_embed(title, price, fee_amount, fee_percent, net, t.get("Status", ""), buy_price))
 
         # 1) обновляем цены уже выставленных офферов
         offers = await asyncio.to_thread(get_user_offers)
@@ -559,7 +613,7 @@ async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
 
     # Уведомление владельцу при старте: сначала ЛС, при неудаче — пинг в канале
-    await _notify_owner("Дай любой ответ на то что я тебе написал в тг")
+    await _notify_owner("Иди к успеху мужик")
 
     # Проверка JWT при старте — токен короткоживущий, протухает периодически
     if await asyncio.to_thread(jwt_is_valid):

@@ -10,7 +10,8 @@ def rebid_embed(title: str, old_price: float, new_price: float, net: float) -> d
     return embed
 
 
-def offer_sold_embed(title: str, price: float, fee_amount: float, fee_percent: float, net: float, status: str) -> discord.Embed:
+def offer_sold_embed(title: str, price: float, fee_amount: float, fee_percent: float, net: float, status: str,
+                     buy_price: float | None = None) -> discord.Embed:
     pending = status == "trade_protected"
     embed = discord.Embed(
         title="💸 Скин продан",
@@ -20,6 +21,13 @@ def offer_sold_embed(title: str, price: float, fee_amount: float, fee_percent: f
     embed.add_field(name="Цена продажи", value=f"**${price:.2f}**", inline=True)
     embed.add_field(name="Комиссия", value=f"**${fee_amount:.2f}** ({fee_percent * 100:.0f}%)", inline=True)
     embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
+    if buy_price is not None:
+        profit = net - buy_price
+        sign = "🟢" if profit >= 0 else "🔴"
+        embed.add_field(name="Покупка", value=f"**${buy_price:.2f}**", inline=True)
+        embed.add_field(name="Прибыль (с учётом покупки)", value=f"{sign} **${profit:.2f}**", inline=True)
+    else:
+        embed.add_field(name="Прибыль (с учётом покупки)", value="— (цена покупки неизвестна)", inline=True)
     status_label = "🔒 Trade-protected (деньги в ожидании)" if pending else "✅ Завершена"
     embed.add_field(name="Статус", value=status_label, inline=False)
     return embed

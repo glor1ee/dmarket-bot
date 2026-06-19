@@ -382,7 +382,7 @@ async def scan_loop():
                 balance = await asyncio.to_thread(get_balance)
                 within_limit = balance is not None and auto_price <= balance * 0.60
 
-                if within_limit and auto_price > 5:
+                if within_limit and auto_price > 4:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
                     placed = auto_price if (ok and new_id) else None
                 else:

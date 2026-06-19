@@ -29,6 +29,8 @@ TARTGETS_CHANNEL_ID = 1513234981269278750
 CLOSED_TARGETS_CHANNEL_ID = 1516105280499224768
 CLOSED_OFFERS_CHANNEL_ID = 1516208442967331039
 
+OWNER_USER_ID = 421320508986884096
+
 # TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
 _synced_closed_ids: set[str] = set()
 # OfferID закрытых офферов (продаж), уже обработанных (заполняется в on_ready).
@@ -211,20 +213,29 @@ class InventoryControlView(discord.ui.View):
         await interaction.followup.send(embed=inventory_embed(items, balance), ephemeral=True)
 
 
-MAX_SALE_GAP_DAYS = 2  # «нормальный» интервал между продажами, в днях
-MAX_LARGE_GAPS = 2     # сколько разрывов больше нормы допускаем 
+MIN_OFFER_SALES = 12       # минимум продаж через офферы в выборке (из ~30)
+MIN_SALES_PER_DAY = 1      # минимальная скорость продаж-офферов в день
+MAX_LAST_AGE_HOURS = 36    # не старше: часов с последней продажи
 
 
-def _count_large_gaps(sales: list, max_gap_days: int = MAX_SALE_GAP_DAYS) -> int | None:
-    """Сколько разрывов между соседними продажами (и от последней до «сейчас»)
-    превышают max_gap_days дней. None — если данных о продажах нет."""
-    timestamps = sorted(int(s.get("date", 0)) for s in sales if s.get("date"))
-    if not timestamps:
-        return None
+def liquidity_score(sales: list) -> dict:
+    """Простая ликвидность: достаточно продаж через офферы + скорость + свежесть.
+
+    offers     — продаж через офферы в выборке
+    rate       — продаж-офферов в день за период выборки
+    last_age_h — часов с последней продажи (любого типа)
+    ok         — прошёл ли пороги
+    """
     now = datetime.now(tz=KYIV).timestamp()
-    points = timestamps + [now]  # включаем «сейчас» — учитываем свежесть последней продажи
-    gap_limit = max_gap_days * 86400
-    return sum(1 for i in range(len(points) - 1) if points[i + 1] - points[i] > gap_limit)
+    ts = sorted(int(s.get("date", 0)) for s in sales if s.get("date"))
+    offer_sales = [s for s in sales if s.get("txOperationType") == "Offer"]
+    if len(offer_sales) < MIN_OFFER_SALES or len(ts) < 2:
+        return {"ok": False, "rate": 0.0, "last_age_h": 999.0, "n": len(ts), "offers": len(offer_sales)}
+    span_days = max((ts[-1] - ts[0]) / 86400, 1)
+    rate = len(offer_sales) / span_days
+    last_age_h = (now - ts[-1]) / 3600
+    ok = rate >= MIN_SALES_PER_DAY and last_age_h <= MAX_LAST_AGE_HOURS
+    return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales)}
 
 
 async def scan_loop():
@@ -267,7 +278,7 @@ async def scan_loop():
             if net < 1 or net > 10:
                 continue
 
-            sales = await asyncio.to_thread(get_last_sales, title, 10)
+            sales = await asyncio.to_thread(get_last_sales, title, 30)
             if not sales:
                 continue
 
@@ -276,12 +287,8 @@ async def scan_loop():
                 day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
                 day_counts[day] += 1
 
-            large_gaps = _count_large_gaps(sales)
-            liquid = (
-                large_gaps is not None
-                and large_gaps <= MAX_LARGE_GAPS
-                and any(count >= 3 for count in day_counts.values())
-            )
+            liq = liquidity_score(sales)
+            liquid = liq["ok"]
 
             offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
             target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
@@ -313,12 +320,16 @@ async def scan_loop():
             lines.append(f"   Прибыль (сред−10%−таргет): **${profit:.2f}**")
             lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
             lines.append(f"   Макс продаж за день: **{max(day_counts.values())}**")
+            lines.append(
+                f"   Ликвидность {'🟢' if liquid else '🔴'}: "
+                f"офферов **{liq['offers']}** | **{liq['rate']:.2f}/день** | "
+                f"свежесть **{liq['last_age_h']:.0f}ч** | выборка {liq['n']}"
+            )
 
             channel = profit_channel if profit > 0 else review_channel
             await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
-            more_offers_than_targets = len(offer_prices) > len(target_prices)
-            if profit > 0 and liquid and more_offers_than_targets:
+            if profit > 0 and liquid:
                 auto_price = round(max_target + 0.02, 2)
                 balance = await asyncio.to_thread(get_balance)
                 within_limit = balance is not None and auto_price <= balance * 0.60
@@ -397,8 +408,6 @@ async def rebid_loop():
                         embed=rebid_embed(title, my_price, new_price, net),
                         view=DeleteTargetView(target_id=new_id),
                     )
-            else:
-                print(f"⚠️ rebid: '{title}' новый таргет (${new_price:.2f}) не встал после ретраев: {place_err}")
 
 
 def _undercut_cents(min_offer: float) -> int:
@@ -531,10 +540,26 @@ async def offer_update_loop():
                 await _list_unlisted(channel, title, asset_id)
 
 
+async def _notify_owner(text: str) -> None:
+    """Сообщение владельцу: сначала ЛС, при неудаче — пинг в первом доступном канале."""
+    if not OWNER_USER_ID:
+        return
+    try:
+        owner = await client.fetch_user(OWNER_USER_ID)
+        await owner.send(text)
+        print("📩 Владельцу отправлено в ЛС")
+        return
+    except Exception as e:
+        print(f"⚠️ ЛС не прошло ({e}); пробую упомянуть в канале")
+
+
 @client.event
 async def on_ready():
     global _synced_closed_ids, _synced_closed_offer_ids
     print(f"✅ Бот запущен как {client.user}")
+
+    # Уведомление владельцу при старте: сначала ЛС, при неудаче — пинг в канале
+    await _notify_owner("Дай любой ответ на то что я тебе написал в тг")
 
     # Проверка JWT при старте — токен короткоживущий, протухает периодически
     if await asyncio.to_thread(jwt_is_valid):

@@ -380,7 +380,7 @@ async def scan_loop():
             if profit > 0 and liquid:
                 auto_price = round(max_target + 0.02, 2)
                 balance = await asyncio.to_thread(get_balance)
-                within_limit = balance is not None and auto_price <= balance * 0.60
+                within_limit = balance is not None and auto_price <= (balance if balance < 25 else balance * 0.60)
 
                 if within_limit and auto_price > 4:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)

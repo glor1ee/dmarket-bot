@@ -15,7 +15,7 @@ import fees
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = 1510652051749732544
+CONTROL_CHANNEL_ID = 1510646017865810024
 PROFIT_CHANNEL_ID = 1511801054918869196
 REVIEW_CHANNEL_ID = 1511801444825698404
 LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
@@ -31,10 +31,20 @@ CLOSED_OFFERS_CHANNEL_ID = 1516208442967331039
 
 OWNER_USER_ID = 421320508986884096
 
+
+min_balance = 111 # если баланс меньше, не ставим авто-таргет (даже если прибыльный), чтобы не блокировать деньги в оффере при ошибке
+
 # TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
 _synced_closed_ids: set[str] = set()
 # OfferID закрытых офферов (продаж), уже обработанных (заполняется в on_ready).
 _synced_closed_offer_ids: set[str] = set()
+
+# Панель управления: счётчик сбросов seen в scan_loop + отложенные действия по нему
+_seen_reset_count = 0
+_stop_bot_at_resets: int | None = None   # остановить бота при достижении этого числа сбросов
+_shutdown_at_resets: int | None = None   # выключить устройство при достижении этого числа сбросов
+_stop_bot_task: "asyncio.Task | None" = None    # таймер остановки бота (для отмены)
+_shutdown_task: "asyncio.Task | None" = None     # таймер выключения ПК (для отмены)
 
 # Депонированные на DMarket предметы имеют UUID в attributes.id (Steam-предметы — нет).
 # Только для них доступен batchCreate/batchUpdate.
@@ -242,29 +252,154 @@ class InventoryControlView(discord.ui.View):
         await interaction.followup.send(embed=inventory_embed(items, balance), ephemeral=True)
 
 
+async def _stop_bot_after(seconds: int) -> None:
+    await asyncio.sleep(seconds)
+    print(f"⏹ Остановка бота по таймеру ({seconds // 60} мин)")
+    await client.close()
+
+
+async def _shutdown_after(seconds: int) -> None:
+    await asyncio.sleep(seconds)
+    print(f"⏻ Выключение устройства по таймеру ({seconds // 60} мин)")
+    os.system("shutdown /s /t 0")
+
+
+async def _on_stop_minutes(interaction: discord.Interaction, n: int) -> None:
+    global _stop_bot_task
+    if _stop_bot_task and not _stop_bot_task.done():
+        _stop_bot_task.cancel()
+    _stop_bot_task = asyncio.ensure_future(_stop_bot_after(n * 60))
+    await interaction.response.send_message(f"⏹ Бот будет остановлен через **{n} мин**.", ephemeral=True)
+
+
+async def _on_stop_resets(interaction: discord.Interaction, n: int) -> None:
+    global _stop_bot_at_resets
+    _stop_bot_at_resets = _seen_reset_count + n
+    await interaction.response.send_message(
+        f"♻️ Бот остановится после **{n}** сбросов seen (счётчик сейчас {_seen_reset_count}).", ephemeral=True)
+
+
+async def _on_shutdown_minutes(interaction: discord.Interaction, n: int) -> None:
+    global _shutdown_task
+    if _shutdown_task and not _shutdown_task.done():
+        _shutdown_task.cancel()
+    _shutdown_task = asyncio.ensure_future(_shutdown_after(n * 60))
+    await interaction.response.send_message(f"⏻ Устройство выключится через **{n} мин**.", ephemeral=True)
+
+
+async def _on_shutdown_resets(interaction: discord.Interaction, n: int) -> None:
+    global _shutdown_at_resets
+    _shutdown_at_resets = _seen_reset_count + n
+    await interaction.response.send_message(
+        f"♻️ Устройство выключится после **{n}** сбросов seen (счётчик сейчас {_seen_reset_count}).", ephemeral=True)
+
+
+async def _on_cancel(interaction: discord.Interaction) -> None:
+    """Отменяет все запланированные действия: таймеры и цели по сбросам seen."""
+    global _stop_bot_at_resets, _shutdown_at_resets, _stop_bot_task, _shutdown_task
+    cancelled = []
+    if _stop_bot_task and not _stop_bot_task.done():
+        _stop_bot_task.cancel()
+        cancelled.append("стоп бота (таймер)")
+    _stop_bot_task = None
+    if _shutdown_task and not _shutdown_task.done():
+        _shutdown_task.cancel()
+        cancelled.append("выключение ПК (таймер)")
+    _shutdown_task = None
+    if _stop_bot_at_resets is not None:
+        cancelled.append("стоп бота (сбросы seen)")
+        _stop_bot_at_resets = None
+    if _shutdown_at_resets is not None:
+        cancelled.append("выключение ПК (сбросы seen)")
+        _shutdown_at_resets = None
+    msg = "🚫 Отменено: " + ", ".join(cancelled) if cancelled else "Нечего отменять."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+class ValueModal(discord.ui.Modal):
+    """Универсальная модалка: одно положительное число → передаётся в handler."""
+    def __init__(self, title: str, label: str, handler):
+        super().__init__(title=title)
+        self.handler = handler
+        self.value_input = discord.ui.TextInput(label=label, placeholder="число", required=True, max_length=6)
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            n = int(self.value_input.value.strip())
+            if n <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Нужно положительное целое число.", ephemeral=True)
+            return
+        await self.handler(interaction, n)
+
+
+class ControlPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="⏹ Стоп бота (мин)", style=discord.ButtonStyle.danger, custom_id="ctrl_stop_min")
+    async def stop_min(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Стоп бота через N минут", "Минут", _on_stop_minutes))
+
+    @discord.ui.button(label="⏹ Стоп бота (сбросы seen)", style=discord.ButtonStyle.danger, custom_id="ctrl_stop_resets")
+    async def stop_resets(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Стоп бота через N сбросов seen", "Кол-во сбросов", _on_stop_resets))
+
+    @discord.ui.button(label="⏻ Выключить ПК (мин)", style=discord.ButtonStyle.secondary, custom_id="ctrl_shutdown_min")
+    async def shutdown_min(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Выключить ПК через N минут", "Минут", _on_shutdown_minutes))
+
+    @discord.ui.button(label="⏻ Выключить ПК (сбросы seen)", style=discord.ButtonStyle.secondary, custom_id="ctrl_shutdown_resets")
+    async def shutdown_resets(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Выключить ПК через N сбросов seen", "Кол-во сбросов", _on_shutdown_resets))
+
+    @discord.ui.button(label="🚫 Отменить всё", style=discord.ButtonStyle.success, custom_id="ctrl_cancel")
+    async def cancel_all(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _on_cancel(interaction)
+
+
 MIN_OFFER_SALES = 12       # минимум продаж через офферы в выборке (из ~30)
-MIN_SALES_PER_DAY = 0.5      # минимальная скорость продаж-офферов в день
+MIN_SALES_PER_DAY = 1      # минимальная скорость продаж-офферов в день
 MAX_LAST_AGE_HOURS = 36    # не старше: часов с последней продажи
+BURST_WINDOW_S = 300       # окно всплеска, секунд (5 минут)
+MAX_SALES_PER_BURST = 3    # больше стольких продаж в окне → подозрительный всплеск, не ликвид
+
+
+def _has_burst(ts: list, window_s: int = BURST_WINDOW_S, max_in_window: int = MAX_SALES_PER_BURST) -> bool:
+    """True, если в каком-то окне window_s секунд продаж больше max_in_window
+    (скользящее окно по отсортированным таймстампам)."""
+    j = 0
+    for i in range(len(ts)):
+        while ts[i] - ts[j] > window_s:
+            j += 1
+        if i - j + 1 >= max_in_window:
+            return True
+    return False
 
 
 def liquidity_score(sales: list) -> dict:
-    """Простая ликвидность: достаточно продаж через офферы + скорость + свежесть.
+    """Простая ликвидность: достаточно продаж через офферы + скорость + свежесть,
+    и без подозрительного всплеска (>3 продаж за 5 минут).
 
     offers     — продаж через офферы в выборке
     rate       — продаж-офферов в день за период выборки
     last_age_h — часов с последней продажи (любого типа)
+    burst      — был ли всплеск >3 продаж за 5 минут
     ok         — прошёл ли пороги
     """
     now = datetime.now(tz=KYIV).timestamp()
     ts = sorted(int(s.get("date", 0)) for s in sales if s.get("date"))
     offer_sales = [s for s in sales if s.get("txOperationType") == "Offer"]
     if len(offer_sales) < MIN_OFFER_SALES or len(ts) < 2:
-        return {"ok": False, "rate": 0.0, "last_age_h": 999.0, "n": len(ts), "offers": len(offer_sales)}
+        return {"ok": False, "rate": 0.0, "last_age_h": 999.0, "n": len(ts), "offers": len(offer_sales), "burst": False}
     span_days = max((ts[-1] - ts[0]) / 86400, 1)
     rate = len(offer_sales) / span_days
     last_age_h = (now - ts[-1]) / 3600
-    ok = rate >= MIN_SALES_PER_DAY and last_age_h <= MAX_LAST_AGE_HOURS
-    return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales)}
+    burst = _has_burst(ts)
+    ok = rate >= MIN_SALES_PER_DAY and last_age_h <= MAX_LAST_AGE_HOURS and not burst
+    return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales), "burst": burst}
 
 
 def build_skin_info(title: str, sales: list, min_offer: float | None = None,
@@ -283,16 +418,21 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
     target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
     avg_offer = sum(offer_prices) / len(offer_prices) if offer_prices else None
     liq = liquidity_score(sales)
-    net = (min_offer * 0.90 - max_target) if (min_offer is not None and max_target is not None) else None
-    profit = (avg_offer * 0.90 - max_target) if (avg_offer is not None and max_target is not None) else None
+    # реальная комиссия на продажу (2% для льготных скинов, иначе 10%)
+    sell_ref = min_offer if min_offer is not None else avg_offer
+    fee = fees.fee_fraction(title, sell_ref) if sell_ref is not None else 0.10
+    keep = 1 - fee
+    net = (min_offer * keep - max_target) if (min_offer is not None and max_target is not None) else None
+    profit = (avg_offer * keep - max_target) if (avg_offer is not None and max_target is not None) else None
 
     emoji = "🟢" if (profit is not None and profit > 0) else "🔴"
     mo = f"${min_offer:.2f}" if min_offer is not None else "—"
     mt = f"${max_target:.2f}" if max_target is not None else "—"
     net_s = f"${net:.2f}" if net is not None else "—"
+    fee_s = f" · комиссия {fee * 100:.0f}%" if net is not None else ""
     lines = [
         f"{emoji} **{title}**",
-        f"   ОФФЕР: **{mo}** | ТАРГЕТ: **{mt}** | Прибыль: **{net_s}**",
+        f"   ОФФЕР: **{mo}** | ТАРГЕТ: **{mt}** | Прибыль: **{net_s}**{fee_s}",
     ]
     if buy_price is not None:
         lines.append(f"   Цена покупки: **${buy_price:.2f}**")
@@ -300,12 +440,12 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
         dt = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y %H:%M")
         lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?'):<8} {dt}")
     if offer_prices:
-        lines.append(f"   Макс оффер:  **${max(offer_prices):.2f}**")
+        lines.append(f"   Минимальный оффер:  **${min(offer_prices):.2f}**")
         lines.append(f"   Сред оффер:  **${avg_offer:.2f}**")
     if target_prices:
         lines.append(f"   Макс таргет: **${max(target_prices):.2f}**")
     if profit is not None:
-        lines.append(f"   Прибыль (сред−10%−таргет): **${profit:.2f}**")
+        lines.append(f"   Прибыль (сред−{fee * 100:.0f}%−таргет): **${profit:.2f}**")
     if day_counts:
         avg_per_day = sum(day_counts.values()) / len(day_counts)
         lines.append(f"   Сред продаж в день: **{avg_per_day:.2f}**")
@@ -314,6 +454,7 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
         f"   Ликвидность {'🟢' if liq['ok'] else '🔴'}: "
         f"офферов **{liq['offers']}** | **{liq['rate']:.2f}/день** | "
         f"свежесть **{liq['last_age_h']:.0f}ч** | выборка {liq['n']}"
+        f"{' | ⚠️ всплеск >3/5мин' if liq.get('burst') else ''}"
     )
     return {
         "lines": lines, "liq": liq, "avg_offer": avg_offer,
@@ -323,6 +464,7 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
 
 
 async def scan_loop():
+    global _seen_reset_count
     await client.wait_until_ready()
     profit_channel = client.get_channel(PROFIT_CHANNEL_ID)
     review_channel = client.get_channel(REVIEW_CHANNEL_ID)
@@ -334,7 +476,16 @@ async def scan_loop():
         if asyncio.get_event_loop().time() - seen_reset_at >= 7200:
             seen.clear()
             seen_reset_at = asyncio.get_event_loop().time()
-            print("♻️ seen сброшен")
+            _seen_reset_count += 1
+            print(f"♻️ seen сброшен (#{_seen_reset_count})")
+            if _stop_bot_at_resets is not None and _seen_reset_count >= _stop_bot_at_resets:
+                print("⏹ Достигнут лимит сбросов seen — остановка бота")
+                await client.close()
+                return
+            if _shutdown_at_resets is not None and _seen_reset_count >= _shutdown_at_resets:
+                print("⏻ Достигнут лимит сбросов seen — выключение устройства")
+                os.system("shutdown /s /t 0")
+                return
         try:
             skins = await asyncio.to_thread(get_recommended_skins)
         except Exception as e:
@@ -358,8 +509,9 @@ async def scan_loop():
             if min_offer is None or max_target is None or max_target == 0:
                 continue
 
-            net = min_offer * 0.90 - max_target
-            if net < 1 or net > 10:
+            fee = fees.fee_fraction(title, min_offer) if min_offer is not None else 0.10
+            net = min_offer * (1 - fee) - max_target
+            if net < 3:
                 continue
 
             sales = await asyncio.to_thread(get_last_sales, title, 30)
@@ -374,13 +526,16 @@ async def scan_loop():
             liquid = info["liq"]["ok"]
             lines = info["lines"]
 
-            channel = profit_channel if profit > 0 else review_channel
-            await channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
+            # profit>0 → profit-канал; иначе в review только если ликвид (неликвид-мусор не постим)
+            if profit > 0:
+                await profit_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
+            elif liquid:
+                await review_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
-            if profit > 0 and liquid:
+            if profit >= 2 and liquid:
                 auto_price = round(max_target + 0.02, 2)
                 balance = await asyncio.to_thread(get_balance)
-                within_limit = balance is not None and auto_price <= (balance if balance < 25 else balance * 0.60)
+                within_limit = balance is not None and auto_price <= (balance if auto_price <= min_balance and balance > min_balance else balance * 0.70)
 
                 if within_limit and auto_price > 4:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
@@ -639,6 +794,7 @@ async def on_ready():
     client.add_view(TargetsControlView())
     client.add_view(OffersControlView())
     client.add_view(InventoryControlView())
+    client.add_view(ControlPanelView())
 
     my_targets_channel = client.get_channel(MY_TARGETS_CHANNEL_ID)
     if my_targets_channel:
@@ -655,6 +811,14 @@ async def on_ready():
                 await msg.delete()
                 break
         await my_offers_channel.send("📦 **Мои офферы**", view=OffersControlView())
+
+    control_channel = client.get_channel(CONTROL_CHANNEL_ID)
+    if control_channel:
+        async for msg in control_channel.history(limit=5):
+            if msg.author == client.user and msg.content == "🎛 **Управление**":
+                await msg.delete()
+                break
+        await control_channel.send("🎛 **Управление**", view=ControlPanelView())
 
     my_inventory_channel = client.get_channel(MY_INVENTORY_CHANNEL_ID)
     if my_inventory_channel:

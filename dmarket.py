@@ -278,19 +278,19 @@ def get_closed_offers() -> list:
     return all_trades
 
 
-def place_target(title: str, price_usd: float) -> tuple[bool, str, str | None]:
+def place_target(title: str, price_usd: float, float_bucket: str | None = None) -> tuple[bool, str, str | None]:
+    """Ставит таргет. float_bucket (напр. 'BS-0') — фильтр по диапазону износа
+    для перчаток/ножей (Attrs.floatPartValue). Без него — таргет на любой float."""
     import json
     url = f"{BASE_URL}/marketplace-api/v1/user-targets/create"
-    body_data = {
-        "GameID": GAME_ID,
-        "Targets": [
-            {
-                "Title": title,
-                "Amount": 1,
-                "Price": {"Currency": "USD", "Amount": str(price_usd)},
-            }
-        ],
+    target = {
+        "Title": title,
+        "Amount": 1,
+        "Price": {"Currency": "USD", "Amount": str(price_usd)},
     }
+    if float_bucket:
+        target["Attrs"] = {"floatPartValue": float_bucket}
+    body_data = {"GameID": GAME_ID, "Targets": [target]}
     body_str = json.dumps(body_data, separators=(",", ":"))
     headers = {
         "Authorization": _JWT,

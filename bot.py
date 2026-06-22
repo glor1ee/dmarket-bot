@@ -33,6 +33,8 @@ OWNER_USER_ID = 421320508986884096
 
 
 min_balance = 111 # если баланс меньше, не ставим авто-таргет (даже если прибыльный), чтобы не блокировать деньги в оффере при ошибке
+placed_targets = []
+
 
 # TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
 _synced_closed_ids: set[str] = set()
@@ -45,6 +47,8 @@ _stop_bot_at_resets: int | None = None   # остановить бота при 
 _shutdown_at_resets: int | None = None   # выключить устройство при достижении этого числа сбросов
 _stop_bot_task: "asyncio.Task | None" = None    # таймер остановки бота (для отмены)
 _shutdown_task: "asyncio.Task | None" = None     # таймер выключения ПК (для отмены)
+_scan_active = True                              # активен ли scan_loop (пауза/возобновление)
+_scan_toggle_task: "asyncio.Task | None" = None  # таймер вкл/выкл скана (для отмены)
 
 # Депонированные на DMarket предметы имеют UUID в attributes.id (Steam-предметы — нет).
 # Только для них доступен batchCreate/batchUpdate.
@@ -97,6 +101,7 @@ class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"
         if ok:
             await interaction.followup.send(f"✅ Таргет поставлен: **${price_val:.2f}**", ephemeral=True)
             targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
+            placed_targets.append(self.skin_title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
             if targets_channel and target_id:
                 await targets_channel.send(
                     embed=target_embed(self.skin_title, price_val, interaction.user),
@@ -155,6 +160,7 @@ class LinkButton(discord.ui.View):
         if ok:
             await interaction.followup.send(f"✅ Авто-таргет поставлен: **${auto_price:.2f}**", ephemeral=True)
             targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
+            placed_targets.append(self.title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
             if targets_channel and target_id:
                 await targets_channel.send(
                     embed=target_embed(self.title, auto_price, interaction.user),
@@ -296,24 +302,63 @@ async def _on_shutdown_resets(interaction: discord.Interaction, n: int) -> None:
 
 async def _on_cancel(interaction: discord.Interaction) -> None:
     """Отменяет все запланированные действия: таймеры и цели по сбросам seen."""
-    global _stop_bot_at_resets, _shutdown_at_resets, _stop_bot_task, _shutdown_task
+    global _stop_bot_at_resets, _shutdown_at_resets, _stop_bot_task, _shutdown_task, _scan_toggle_task
     cancelled = []
     if _stop_bot_task and not _stop_bot_task.done():
         _stop_bot_task.cancel()
-        cancelled.append("стоп бота (таймер)")
+        cancelled.append("остановка бота по таймеру")
     _stop_bot_task = None
     if _shutdown_task and not _shutdown_task.done():
         _shutdown_task.cancel()
-        cancelled.append("выключение ПК (таймер)")
+        cancelled.append("выключение ПК по таймеру")
     _shutdown_task = None
+    if _scan_toggle_task and not _scan_toggle_task.done():
+        _scan_toggle_task.cancel()
+        cancelled.append("вкл/выкл скана по таймеру")
+    _scan_toggle_task = None
     if _stop_bot_at_resets is not None:
-        cancelled.append("стоп бота (сбросы seen)")
+        cancelled.append("остановка бота (сбросы seen)")
         _stop_bot_at_resets = None
     if _shutdown_at_resets is not None:
         cancelled.append("выключение ПК (сбросы seen)")
         _shutdown_at_resets = None
-    msg = "🚫 Отменено: " + ", ".join(cancelled) if cancelled else "Нечего отменять."
+    msg = "✅ Отменено: " + ", ".join(cancelled) if cancelled else "Нечего отменять."
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+async def _scan_set_after(seconds: int, active: bool) -> None:
+    await asyncio.sleep(seconds)
+    global _scan_active
+    _scan_active = active
+    print(f"{'▶️ scan_loop включён' if active else '⏸ scan_loop на паузе'} по таймеру ({seconds // 60} мин)")
+
+
+async def _on_scan_on(interaction: discord.Interaction) -> None:
+    global _scan_active
+    _scan_active = True
+    await interaction.response.send_message("▶️ scan_loop активирован.", ephemeral=True)
+
+
+async def _on_scan_off(interaction: discord.Interaction) -> None:
+    global _scan_active
+    _scan_active = False
+    await interaction.response.send_message("⏸ scan_loop поставлен на паузу.", ephemeral=True)
+
+
+async def _on_scan_on_minutes(interaction: discord.Interaction, n: int) -> None:
+    global _scan_toggle_task
+    if _scan_toggle_task and not _scan_toggle_task.done():
+        _scan_toggle_task.cancel()
+    _scan_toggle_task = asyncio.ensure_future(_scan_set_after(n * 60, True))
+    await interaction.response.send_message(f"▶️ scan_loop включится через **{n} мин**.", ephemeral=True)
+
+
+async def _on_scan_off_minutes(interaction: discord.Interaction, n: int) -> None:
+    global _scan_toggle_task
+    if _scan_toggle_task and not _scan_toggle_task.done():
+        _scan_toggle_task.cancel()
+    _scan_toggle_task = asyncio.ensure_future(_scan_set_after(n * 60, False))
+    await interaction.response.send_message(f"⏸ scan_loop встанет на паузу через **{n} мин**.", ephemeral=True)
 
 
 class ValueModal(discord.ui.Modal):
@@ -355,7 +400,23 @@ class ControlPanelView(discord.ui.View):
     async def shutdown_resets(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await interaction.response.send_modal(ValueModal("Выключить ПК через N сбросов seen", "Кол-во сбросов", _on_shutdown_resets))
 
-    @discord.ui.button(label="🚫 Отменить всё", style=discord.ButtonStyle.success, custom_id="ctrl_cancel")
+    @discord.ui.button(label="▶️ Скан вкл", style=discord.ButtonStyle.success, custom_id="ctrl_scan_on")
+    async def scan_on(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _on_scan_on(interaction)
+
+    @discord.ui.button(label="⏸ Скан выкл", style=discord.ButtonStyle.secondary, custom_id="ctrl_scan_off")
+    async def scan_off(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _on_scan_off(interaction)
+
+    @discord.ui.button(label="▶️ Скан вкл (мин)", style=discord.ButtonStyle.success, custom_id="ctrl_scan_on_min")
+    async def scan_on_min(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Включить скан через N минут", "Минут", _on_scan_on_minutes))
+
+    @discord.ui.button(label="⏸ Скан выкл (мин)", style=discord.ButtonStyle.secondary, custom_id="ctrl_scan_off_min")
+    async def scan_off_min(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.send_modal(ValueModal("Выключить скан через N минут", "Минут", _on_scan_off_minutes))
+
+    @discord.ui.button(label="🚫 Отменить всё", style=discord.ButtonStyle.primary, custom_id="ctrl_cancel")
     async def cancel_all(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await _on_cancel(interaction)
 
@@ -402,6 +463,30 @@ def liquidity_score(sales: list) -> dict:
     return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales), "burst": burst}
 
 
+# Диапазоны float по экстерьеру (для отсева премиального низкого float — бакета "-0").
+EXTERIOR_FLOAT_RANGE = {
+    "Minimal Wear": (0.07, 0.15),
+    "Field-Tested": (0.15, 0.38),
+    "Well-Worn": (0.38, 0.45),
+    "Battle-Scarred": (0.45, 1.00),
+}
+
+
+def _premium_float_threshold(title: str) -> float | None:
+    """Граница «премиального» низкого float (бакет -0) для экстерьера из title.
+    None — для Factory New (исключаем) или если экстерьер не распознан/нет износа."""
+    m = re.search(r"\(([^)]+)\)\s*$", title)
+    ext = m.group(1) if m else ""
+    premium_frac = 0.20  
+    if ext == "Field-Tested" or ext == "Well-Worn":
+        premium_frac = 0.3 
+    rng = EXTERIOR_FLOAT_RANGE.get(ext)  # FN намеренно отсутствует → None
+    if not rng:
+        return None
+    lo, hi = rng
+    return lo + (hi - lo) * premium_frac
+
+
 def build_skin_info(title: str, sales: list, min_offer: float | None = None,
                     max_target: float | None = None, buy_price: float | None = None) -> dict:
     """Инфо-блок о скине (строки + метрики) из УЖЕ полученных данных.
@@ -414,9 +499,22 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
         day = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %Y")
         day_counts[day] += 1
 
-    offer_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
+    offer_sales = [s for s in sales if s.get("txOperationType") == "Offer" and s.get("price")]
+    offer_prices = [float(s["price"]) for s in offer_sales]  # полный список — для отображения/счёта
     target_prices = [float(s["price"]) for s in sales if s.get("txOperationType") == "Target" and s.get("price")]
-    avg_offer = sum(offer_prices) / len(offer_prices) if offer_prices else None
+
+    # средняя цена БЕЗ премиальных низко-float продаж (бакет -0), чтобы они не надували профит
+    premium_thr = _premium_float_threshold(title)
+
+    def _is_premium_low_float(s: dict) -> bool:
+        if premium_thr is None:
+            return False
+        fv = s.get("offerAttributes", {}).get("floatValue")
+        return fv is not None and fv <= premium_thr
+
+    avg_prices = [float(s["price"]) for s in offer_sales if not _is_premium_low_float(s)]
+    premium_excluded = len(offer_prices) - len(avg_prices)
+    avg_offer = sum(avg_prices) / len(avg_prices) if avg_prices else None
     liq = liquidity_score(sales)
     # реальная комиссия на продажу (2% для льготных скинов, иначе 10%)
     sell_ref = min_offer if min_offer is not None else avg_offer
@@ -441,7 +539,11 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
         lines.append(f"   `{s.get('txOperationType', '?'):<7}` ${s.get('price', '?'):<8} {dt}")
     if offer_prices:
         lines.append(f"   Минимальный оффер:  **${min(offer_prices):.2f}**")
-        lines.append(f"   Сред оффер:  **${avg_offer:.2f}**")
+        if avg_offer is not None:
+            extra = f" (без {premium_excluded} премиум-флоат)" if premium_excluded else ""
+            lines.append(f"   Сред оффер:  **${avg_offer:.2f}**{extra}")
+        else:
+            lines.append("   Сред оффер:  — (все продажи — премиум-флоат)")
     if target_prices:
         lines.append(f"   Макс таргет: **${max(target_prices):.2f}**")
     if profit is not None:
@@ -473,6 +575,9 @@ async def scan_loop():
     seen_reset_at = asyncio.get_event_loop().time()
 
     while not client.is_closed():
+        if not _scan_active:
+            await asyncio.sleep(5)  # пауза скана — ждём активации
+            continue
         if asyncio.get_event_loop().time() - seen_reset_at >= 7200:
             seen.clear()
             seen_reset_at = asyncio.get_event_loop().time()
@@ -526,16 +631,14 @@ async def scan_loop():
             liquid = info["liq"]["ok"]
             lines = info["lines"]
 
-            # profit>0 → profit-канал; иначе в review только если ликвид (неликвид-мусор не постим)
-            if profit > 0:
-                await profit_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
-            elif liquid:
-                await review_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
-
+            # Маршрутизация сигнала — взаимоисключающая, без дабл-постов:
+            #   profit>=2 и ликвид  → авто-таргет + liquid_profit
+            #   profit>0 (иначе)    → profit-канал
+            #   ликвид, profit<=0   → review (пограничные); неликвид-мусор не постим
             if profit >= 2 and liquid:
                 auto_price = round(max_target + 0.02, 2)
                 balance = await asyncio.to_thread(get_balance)
-                within_limit = balance is not None and auto_price <= (balance if auto_price <= min_balance and balance > min_balance else balance * 0.70)
+                within_limit = balance is not None and auto_price <= (balance if auto_price <= min_balance else balance * 0.70)
 
                 if within_limit and auto_price > 4:
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
@@ -552,12 +655,17 @@ async def scan_loop():
                 await liquid_profit_channel.send(content="\n".join(lines), view=liquid_view)
 
                 if placed and new_id:
+                    placed_targets.append(title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
                     targets_channel = client.get_channel(TARTGETS_CHANNEL_ID)
                     if targets_channel:
                         await targets_channel.send(
                             embed=target_embed(title, auto_price, client.user),
                             view=DeleteTargetView(target_id=new_id),
                         )
+            elif profit > 0:
+                await profit_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
+            elif liquid:
+                await review_channel.send(content="\n".join(lines), view=LinkButton(title=title, max_target=max_target))
 
 
 
@@ -565,7 +673,7 @@ async def scan_loop():
 async def rebid_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        await asyncio.sleep(905)
+        await asyncio.sleep(910)
 
         # Новые закрытые (купленные) таргеты → пишем цену покупки в JSON + сигнал
         all_closed = await asyncio.to_thread(get_closed_targets)
@@ -588,7 +696,7 @@ async def rebid_loop():
             title = t.get("title", "")
             my_price = int(t.get("priceCents", 0)) / 100
             target_id = t.get("id") or t.get("targetId") or t.get("TargetID")
-            if not title or not target_id:
+            if not title or not target_id or title in placed_targets:
                 continue
 
             min_offer, max_target = await asyncio.to_thread(get_aggregated_prices, title)
@@ -598,8 +706,9 @@ async def rebid_loop():
             if max_target <= my_price:
                 continue  # меня не перебили
 
-            net = min_offer * 0.90 - max_target
-            if net < 1 or net > 10:
+            fee = fees.fee_fraction(title, min_offer) if min_offer is not None else 0.10
+            net = min_offer * (1 - fee) - max_target
+            if net < 2:
                 await asyncio.to_thread(delete_target, target_id)
                 continue # уже не выгодно перебивать
 
@@ -616,6 +725,8 @@ async def rebid_loop():
                         embed=rebid_embed(title, my_price, new_price, net),
                         view=DeleteTargetView(target_id=new_id),
                     )
+
+        placed_targets.clear()  # сбрасываем кэш выставленных таргетов, чтобы не мешал в следующем цикле
 
 
 def _undercut_cents(min_offer: float) -> int:

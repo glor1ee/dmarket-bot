@@ -75,7 +75,8 @@ def get_aggregated_prices(title: str) -> tuple[float | None, float | None]:
 
 def get_market_offers(title: str, limit: int = 50) -> list:
     """Офферы по конкретному скину, отсортированы по цене ↑ (HMAC).
-    Возвращает [(price_usd, offer_id), ...] — для поиска минимума среди чужих.
+    Возвращает [(price_usd, offer_id, trade_lock_seconds), ...] — для поиска минимума
+    среди чужих (trade_lock_seconds = сколько ещё под trade-protection; 0 = уже торгуется).
 
     ВАЖНО: фильтр title= в API подстроночный (ловит и StatTrak™-вариант),
     поэтому оставляем только объекты с ТОЧНЫМ совпадением title."""
@@ -96,14 +97,72 @@ def get_market_offers(title: str, limit: int = 50) -> list:
         for o in r.json().get("objects", []):
             if o.get("title") != title:
                 continue  # подстроночный матч API — отсекаем чужие title
+            extra = o.get("extra") or {}
             price = int(o.get("price", {}).get("USD", 0)) / 100
-            offer_id = (o.get("extra") or {}).get("offerId")
+            offer_id = extra.get("offerId")
+            lock = float(extra.get("tradeLockDuration") or 0)
             if price > 0 and offer_id:
-                result.append((price, offer_id))
+                result.append((price, offer_id, lock))
         return result
     except Exception as e:
         _log_fail("get_market_offers", exc=e)
         return []
+
+
+def get_targets_by_title(title: str) -> list:
+    """Все таргеты (buy orders) по скину с разбивкой по floatPartValue (JWT).
+    Каждый order: {price (центы), amount, attributes.floatPartValue}."""
+    from urllib.parse import quote
+    url = f"{BASE_URL}/marketplace-api/v1/targets-by-title/{GAME_ID}/{quote(title)}"
+    try:
+        r = requests.get(url, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            _log_fail("get_targets_by_title", r)
+            return []
+        return r.json().get("orders", [])
+    except Exception as e:
+        _log_fail("get_targets_by_title", exc=e)
+        return []
+
+
+def get_offers_by_bucket(title: str, limit: int = 100) -> dict:
+    """Мин. цена оффера (USD) по каждому floatPartValue-бакету для скина.
+    Эндпоинт offers-by-title (JWT) — ТОЧНЫЙ матч title (без StatTrak-подстроки).
+    Пагинация по курсору с дедупом по itemId (на случай не-продвигающегося курсора).
+    Возвращает {bucket: min_price}."""
+    url = f"{BASE_URL}/exchange/v1/offers-by-title"
+    headers = {"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}
+    result: dict[str, float] = {}
+    seen_ids: set[str] = set()
+    cursor = ""
+    try:
+        while True:
+            params = {"gameId": GAME_ID, "title": title, "limit": str(limit)}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            if r.status_code != 200:
+                _log_fail("get_offers_by_bucket", r)
+                break
+            data = r.json()
+            objects = data.get("objects", [])
+            new = [o for o in objects if o.get("itemId") not in seen_ids]
+            if not new:
+                break  # новых нет — конец (курсор не продвигается)
+            for o in new:
+                seen_ids.add(o.get("itemId"))
+                bucket = (o.get("extra") or {}).get("floatPartValue")
+                price = int(o.get("price", {}).get("USD", 0)) / 100
+                if bucket and price > 0 and (bucket not in result or price < result[bucket]):
+                    print(f"🟢 {bucket}: ${price:.2f} (itemId={o.get('itemId')})")
+                    result[bucket] = price
+            next_cursor = data.get("cursor", "")
+            if not next_cursor or next_cursor == cursor or len(objects) < limit:
+                break
+            cursor = next_cursor
+    except Exception as e:
+        _log_fail("get_offers_by_bucket", exc=e)
+    return result
 
 
 def get_user_offers() -> list:
@@ -385,10 +444,14 @@ def update_offer(offer_id: str, asset_id: str, price_cents: int) -> tuple[bool, 
     return _post_offer_batch(url, body, "update_offer")
 
 
-def get_last_sales(exact_title: str, limit: int = 20) -> list:
+def get_last_sales(exact_title: str, limit: int = 20, wear_bucket: str | None = None) -> list:
+    """Последние продажи. wear_bucket (напр. 'BS-0') — серверный фильтр по диапазону
+    износа (floatPartValue); с ним тянем и Target-, и Offer-сделки."""
     from urllib.parse import quote
     encoded = quote(exact_title, safe="()")
     url = f"{BASE_URL}/trade-aggregator/v1/last-sales?title={encoded}&gameId={GAME_ID}&limit={limit}"
+    if wear_bucket:
+        url += f"&txOperationType=Target&txOperationType=Offer&filters=floatPartValue%5B%5D={wear_bucket}"
     try:
         r = requests.get(url, headers={"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}, timeout=5)
         if r.status_code != 200:

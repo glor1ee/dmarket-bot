@@ -1,6 +1,7 @@
 import discord
 import os
 import re
+import json
 import asyncio
 import requests.utils
 from collections import Counter
@@ -8,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, jwt_is_valid, get_customized_fees, get_market_offers, get_closed_offers
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, jwt_is_valid, get_customized_fees, get_market_offers, get_closed_offers, get_targets_by_title, get_offers_by_bucket
 from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed, offer_sold_embed
 from store import get_buy_price, sync_closed_targets
 import fees
@@ -19,6 +20,7 @@ CONTROL_CHANNEL_ID = 1510646017865810024
 PROFIT_CHANNEL_ID = 1511801054918869196
 REVIEW_CHANNEL_ID = 1511801444825698404
 LIQUID_PROFIT_CHANNEL_ID = 1512393920078680145
+PREMIUM_CHANNEL_ID = 1518712682960781374
 
 MY_INVENTORY_CHANNEL_ID = 1513469237308559410
 MY_TARGETS_CHANNEL_ID = 1513236279905616054
@@ -201,6 +203,42 @@ class SkinInfoView(discord.ui.View):
             return
         info = build_skin_info(self.title, sales, min_offer, max_target, get_buy_price(self.title))
         await interaction.followup.send("\n".join(info["lines"]), ephemeral=True)
+
+
+class PremiumTargetView(discord.ui.View):
+    """Премиум-сигнал: ссылка + авто-таргет С ФИЛЬТРОМ по конкретному бакету износа."""
+    def __init__(self, title: str, bucket: str, top_target: float):
+        super().__init__(timeout=None)
+        self.title = title
+        self.bucket = bucket
+        self.top_target = top_target
+        url = (
+            "https://dmarket.com/ingame-items/item-list/csgo-skins"
+            f"?title={requests.utils.quote(title)}"
+        )
+        self.add_item(discord.ui.Button(
+            label="🔗 Открыть на DMarket",
+            url=url,
+            style=discord.ButtonStyle.link,
+        ))
+
+    @discord.ui.button(label="🎯 Авто-таргет (фильтр)", style=discord.ButtonStyle.success)
+    async def auto_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        auto_price = round(self.top_target + 0.02, 2)
+        await interaction.response.defer(ephemeral=True)
+        ok, err, target_id = await asyncio.to_thread(place_target, self.title, auto_price, self.bucket)
+        if ok:
+            await interaction.followup.send(
+                f"✅ Авто-таргет **{self.bucket}** на **{self.title}**: **${auto_price:.2f}**", ephemeral=True)
+            placed_targets.append(self.title)
+            targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
+            if targets_channel and target_id:
+                await targets_channel.send(
+                    embed=target_embed(f"{self.title} [{self.bucket}]", auto_price, interaction.user),
+                    view=DeleteTargetView(target_id=target_id),
+                )
+        else:
+            await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
 
 
 class TargetsControlView(discord.ui.View):
@@ -440,9 +478,11 @@ def _has_burst(ts: list, window_s: int = BURST_WINDOW_S, max_in_window: int = MA
     return False
 
 
-def liquidity_score(sales: list) -> dict:
+def liquidity_score(sales: list, min_offer_sales: int = MIN_OFFER_SALES,
+                    min_rate: float = MIN_SALES_PER_DAY, max_age_h: float = MAX_LAST_AGE_HOURS) -> dict:
     """Простая ликвидность: достаточно продаж через офферы + скорость + свежесть,
-    и без подозрительного всплеска (>3 продаж за 5 минут).
+    и без подозрительного всплеска (>3 продаж за 5 минут). Пороги параметризуемы
+    (для по-бакетного премиум-анализа — менее строгие).
 
     offers     — продаж через офферы в выборке
     rate       — продаж-офферов в день за период выборки
@@ -453,13 +493,13 @@ def liquidity_score(sales: list) -> dict:
     now = datetime.now(tz=KYIV).timestamp()
     ts = sorted(int(s.get("date", 0)) for s in sales if s.get("date"))
     offer_sales = [s for s in sales if s.get("txOperationType") == "Offer"]
-    if len(offer_sales) < MIN_OFFER_SALES or len(ts) < 2:
+    if len(offer_sales) < min_offer_sales or len(ts) < 2:
         return {"ok": False, "rate": 0.0, "last_age_h": 999.0, "n": len(ts), "offers": len(offer_sales), "burst": False}
     span_days = max((ts[-1] - ts[0]) / 86400, 1)
     rate = len(offer_sales) / span_days
     last_age_h = (now - ts[-1]) / 3600
     burst = _has_burst(ts)
-    ok = rate >= MIN_SALES_PER_DAY and last_age_h <= MAX_LAST_AGE_HOURS and not burst
+    ok = rate >= min_rate and last_age_h <= max_age_h and not burst
     return {"ok": ok, "rate": rate, "last_age_h": last_age_h, "n": len(ts), "offers": len(offer_sales), "burst": burst}
 
 
@@ -485,6 +525,97 @@ def _premium_float_threshold(title: str) -> float | None:
         return None
     lo, hi = rng
     return lo + (hi - lo) * premium_frac
+
+
+# Префиксы бакетов износа по экстерьеру (для по-бакетного премиум-анализа ножей/перчаток).
+EXTERIOR_PREFIX = {
+    "Minimal Wear": "MW", "Field-Tested": "FT",
+    "Battle-Scarred": "BS",
+}
+PREMIUM_MIN_PROFIT = 2.0     # минимальная прибыль ($) по бакету, чтобы кинуть в premium-канал
+# Менее строгая ликвидность для бакетов (продаж по конкретному износу мало)
+BUCKET_MIN_OFFER_SALES = 12
+BUCKET_MIN_RATE = 0.2        # продаж-офферов в день
+BUCKET_MAX_AGE_H = 100       # свежесть последней продажи, часов (5 дней)
+
+
+def _exterior_buckets(title: str) -> list:
+    """Бакеты износа по экстерьеру из title, напр. BS-0..BS-4. [] если экстерьер не распознан."""
+    m = re.search(r"\(([^)]+)\)\s*$", title)
+    prefix = EXTERIOR_PREFIX.get(m.group(1)) if m else None
+    return [f"{prefix}-{i}" for i in range(3)] if prefix else []
+
+
+async def analyze_premium(title: str) -> list | None:
+    """По-бакетный анализ для ножей/перчаток.
+    По каждому диапазону износа берём фильтрованные last-sales, считаем ликвидность
+    (мягкие пороги) и прибыль = СРЕДНЯЯ цена продаж·(1−комиссия) − мин. оффер бакета.
+    В канал — только бакеты, прошедшие ликвидность И прибыль > PREMIUM_MIN_PROFIT,
+    со статистикой строго по бакету.
+
+    Запросы: targets-by-title + offers-by-bucket + по 1 last-sales на бакет с оффером."""
+    buckets = _exterior_buckets(title)
+    if not buckets:
+        return None
+    orders, offers = await asyncio.gather(
+        asyncio.to_thread(get_targets_by_title, title),
+        asyncio.to_thread(get_offers_by_bucket, title),
+    )
+    if not offers:
+        return None
+
+    target_top: dict[str, float] = {}
+    any_top = 0.0
+    print(title)
+    print(offers)
+    for o in orders:
+        b = o.get("attributes", {}).get("floatPartValue")
+        p = int(o.get("price", 0)) / 100
+        if b == "any":
+            any_top = max(any_top, p)
+        elif b:
+            target_top[b] = max(target_top.get(b, 0.0), p)
+
+    blocks = []
+    for b in buckets:
+        min_offer = offers.get(b)
+        if not min_offer:
+            continue
+
+        # фильтрованные last-sales по бакету
+        sales = await asyncio.to_thread(get_last_sales, title, 30, b)
+        liq = liquidity_score(sales, BUCKET_MIN_OFFER_SALES, BUCKET_MIN_RATE, BUCKET_MAX_AGE_H)
+        if not liq["ok"]:
+            continue
+
+        # прибыль от СРЕДНЕЙ цены продаж по фильтру: avg·(1−комиссия) − мин. оффер
+        prices = [float(s["price"]) for s in sales if s.get("price")]
+        if not prices:
+            continue
+        avg_sale = sum(prices) / len(prices)
+        fee = fees.fee_fraction(title, avg_sale)
+        top_t = max(target_top.get(b, 0.0), any_top)
+        net = min_offer * (1 - fee) - top_t
+        profit = avg_sale * (1 - fee) - top_t
+        if profit < PREMIUM_MIN_PROFIT or net < PREMIUM_MIN_PROFIT:
+            continue
+        recent = sorted(sales, key=lambda s: int(s.get("date", 0)), reverse=True)[:10]
+        sale_lines = []
+        for s in recent:
+            dt = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %H:%M")
+            op = s.get("txOperationType", "?")
+            fv = s.get("offerAttributes", {}).get("floatValue", 0)
+            sale_lines.append(f"      `{op:<7}` ${float(s.get('price', 0)):<8.2f} float {fv:.4f}  {dt}")
+
+        text = (
+            f"💎 **{title}** · 🟢 **{b}** — прибыль **${net:.2f}**\n"
+            f"   купить оффер **${min_offer:.2f}** → ср.продажа **${avg_sale:.2f} −{fee * 100:.0f}% - {top_t}** = **${profit:.2f}**\n"
+            f"   таргет (ref): **${top_t:.2f}** | ликвидность 🟢: офферов **{liq['offers']}** | **{liq['rate']:.2f}/день** | свежесть **{liq['last_age_h']:.0f}ч** | выборка **{liq['n']}**\n"
+            f"   последние продажи ({b}):\n" + "\n".join(sale_lines)
+        )
+        blocks.append((text, b, top_t))  # текст + бакет + топ-таргет (для кнопки авто-таргета с фильтром)
+
+    return blocks or None
 
 
 def build_skin_info(title: str, sales: list, min_offer: float | None = None,
@@ -610,6 +741,15 @@ async def scan_loop():
 
             seen.add(title)
 
+            # Премиум: по-бакетный арбитраж по износу (ножи/перчатки ★) → premium-канал
+            if title.startswith("★"):
+                premium_blocks = await analyze_premium(title)
+                if premium_blocks:
+                    premium_channel = client.get_channel(PREMIUM_CHANNEL_ID)
+                    if premium_channel:
+                        for text, bucket, top_t in premium_blocks:  # отдельное сообщение на бакет (лимит 2000)
+                            await premium_channel.send(content=text, view=PremiumTargetView(title, bucket, top_t))
+
             min_offer, max_target = await asyncio.to_thread(get_aggregated_prices, title)
             if min_offer is None or max_target is None or max_target == 0:
                 continue
@@ -734,16 +874,41 @@ def _undercut_cents(min_offer: float) -> int:
     return int(round(min_offer * 100)) - 1
 
 
-async def _reprice_offer(channel, title, offer_id, asset_id, my_price):
+TRADE_PROTECT_SECONDS = 72 * 3600   # 72 часов: дольше — мой предмет «залип» под защитой
+# Ручной skip-список репрайса (правится вручную, читается свежим при каждом вызове).
+REPRICE_SKIP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reprice_skip.json")
+
+
+def _reprice_skip() -> set:
+    """Скины, которые НЕ репрайсим — ручной список точных title в reprice_skip.json."""
+    try:
+        with open(REPRICE_SKIP_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return set()
+
+
+async def _reprice_offer(channel, title, offer_id, asset_id, my_price, my_lock=0.0):
     """Подгоняет цену оффера под минимум среди чужих офферов (competitor−1¢):
-    вниз если меня перебили, вверх если я стою дешевле рынка. Только если выгодно."""
+    вниз если меня перебили, вверх если я стою дешевле рынка. Только если выгодно.
+
+    Если мой предмет под trade-protection дольше 60 часов — ориентируемся только на
+    конкурентов с МЕНЬШЕЙ защитой (их предметы привлекательнее, надо быть дешевле их)."""
+    if title in _reprice_skip():
+        return  # скин в ручном skip-списке — не трогаем
     buy_price = get_buy_price(title)
     if buy_price is None:
         return  # неизвестна цена последнего таргета — не трогаем
 
     # минимальная цена среди чужих офферов (свой исключаем по offer_id)
     offers = await asyncio.to_thread(get_market_offers, title)
-    competitor = next((p for p, oid in offers if oid != offer_id), None)
+    lock_distance = 32 * 3600 
+    if my_lock > TRADE_PROTECT_SECONDS:
+        if my_lock > 120 * 3600:
+           lock_distance = 48 * 3600 
+        competitor = next((p for p, oid, lock in offers if oid != offer_id and lock + lock_distance < my_lock), None)
+    else:
+        competitor = next((p for p, oid, lock in offers if oid != offer_id), None)
     if competitor is None or competitor <= 0:
         return
 
@@ -843,10 +1008,12 @@ async def offer_update_loop():
             off = offer.get("Offer") or {}
             offer_id = off.get("OfferID")
             asset_id = offer.get("AssetID")
+            attrs = {a["Name"]: a["Value"] for a in offer.get("Attributes", [])}
+            my_lock = float(attrs.get("tradeLockDuration") or 0)  # сколько мой предмет ещё под защитой, сек
             my_price = float(off.get("Price", {}).get("Amount", 0) or 0)
             if not title or not offer_id or not asset_id or my_price <= 0:
                 continue
-            await _reprice_offer(channel, title, offer_id, asset_id, my_price)
+            await _reprice_offer(channel, title, offer_id, asset_id, my_price, my_lock)
 
         # 2) выставляем задепонированные, но ещё не выставленные предметы
         inventory = await asyncio.to_thread(get_user_inventory)

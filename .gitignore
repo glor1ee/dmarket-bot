@@ -5,3 +5,5 @@ __pycache__/
 *.pyo
 .idea/
 cost_basis.json
+test_targets_filter.py
+reprice_skip.json

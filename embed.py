@@ -50,7 +50,7 @@ def offer_update_embed(title: str, old_price: float, new_price: float, buy_price
     embed.add_field(name="Чистыми", value=f"**${net:.2f}**", inline=True)
     if market:
         lines = []
-        for price, oid in market[:6]:
+        for price, oid, *_ in market[:6]:
             mark = "  ← мой" if oid == my_offer_id else ""
             lines.append(f"${price:.2f}{mark}")
         embed.add_field(name="Рынок (топ-6 ↑)", value="\n".join(lines), inline=False)

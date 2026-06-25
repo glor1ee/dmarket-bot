@@ -154,7 +154,6 @@ def get_offers_by_bucket(title: str, limit: int = 100) -> dict:
                 bucket = (o.get("extra") or {}).get("floatPartValue")
                 price = int(o.get("price", {}).get("USD", 0)) / 100
                 if bucket and price > 0 and (bucket not in result or price < result[bucket]):
-                    print(f"🟢 {bucket}: ${price:.2f} (itemId={o.get('itemId')})")
                     result[bucket] = price
             next_cursor = data.get("cursor", "")
             if not next_cursor or next_cursor == cursor or len(objects) < limit:

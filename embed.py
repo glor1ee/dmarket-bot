@@ -33,12 +33,13 @@ def offer_sold_embed(title: str, price: float, fee_amount: float, fee_percent: f
     return embed
 
 
-def offer_update_embed(title: str, old_price: float, new_price: float, buy_price: float, net: float, fee: float = 0.10,
+def offer_update_embed(title: str, old_price: float, new_price: float, buy_price: float, net: float, my_lock: float, fee: float = 0.10,
                        competitor: float | None = None, market: list | None = None, my_offer_id: str | None = None) -> discord.Embed:
     if new_price > old_price:
         head, color = "📈 Цена оффера поднята", discord.Color.green()
     else:
         head, color = "📉 Цена оффера снижена", discord.Color.gold()
+
     embed = discord.Embed(title=head, color=color)
     embed.add_field(name="Скин", value=f"**{title}**", inline=False)
     embed.add_field(name="Было", value=f"**${old_price:.2f}**", inline=True)
@@ -53,6 +54,7 @@ def offer_update_embed(title: str, old_price: float, new_price: float, buy_price
         for price, oid, *_ in market[:6]:
             mark = "  ← мой" if oid == my_offer_id else ""
             lines.append(f"${price:.2f}{mark}")
+        lines.append(f"🔒 Trade Lock: {f'{int(my_lock)} часов' if my_lock < 24 else f'{int(my_lock // 24)}д {int(my_lock % 24)}ч'}")
         embed.add_field(name="Рынок (топ-6 ↑)", value="\n".join(lines), inline=False)
     return embed
 

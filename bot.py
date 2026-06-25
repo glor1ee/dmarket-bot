@@ -222,7 +222,12 @@ class PremiumTargetView(discord.ui.View):
             style=discord.ButtonStyle.link,
         ))
 
-    @discord.ui.button(label="🎯 Авто-таргет (фильтр)", style=discord.ButtonStyle.success)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label == "🎯 Авто-таргет":
+                child.label = f"🎯 Авто-таргет (${top_target + 0.02:.2f})" 
+                break
+
+    @discord.ui.button(label="🎯 Авто-таргет", style=discord.ButtonStyle.success)
     async def auto_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
         auto_price = round(self.top_target + 0.02, 2)
         await interaction.response.defer(ephemeral=True)
@@ -464,6 +469,8 @@ MIN_SALES_PER_DAY = 1      # минимальная скорость прода�
 MAX_LAST_AGE_HOURS = 36    # не старше: часов с последней продажи
 BURST_WINDOW_S = 300       # окно всплеска, секунд (5 минут)
 MAX_SALES_PER_BURST = 3    # больше стольких продаж в окне → подозрительный всплеск, не ликвид
+TARGET_TOP_K = 5           # не-премиум: сколько верхних таргет-уровней сравниваем
+TARGET_MAX_SPREAD = 0.01   # верхний таргет не выше нижнего из топ-K больше чем на 1%
 
 
 def _has_burst(ts: list, window_s: int = BURST_WINDOW_S, max_in_window: int = MAX_SALES_PER_BURST) -> bool:
@@ -476,6 +483,17 @@ def _has_burst(ts: list, window_s: int = BURST_WINDOW_S, max_in_window: int = MA
         if i - j + 1 >= max_in_window:
             return True
     return False
+
+
+def _targets_top_clustered(orders: list, top_k: int = TARGET_TOP_K, max_spread: float = TARGET_MAX_SPREAD) -> tuple[bool, list]:
+    """Верхние таргеты примерно одной цены? Берём top_k РАЗНЫХ ценовых уровней (по убыванию)
+    и проверяем, что самый высокий не выше нижнего из них больше чем на max_spread.
+    Возвращает (ok, top_levels). ok=False если уровней меньше top_k (нельзя судить)."""
+    prices = sorted({int(o.get("price", 0)) / 100 for o in orders if int(o.get("price", 0)) > 0}, reverse=True)
+    top = prices[:top_k]
+    if len(top) < top_k:
+        return False, top
+    return top[0] <= top[-1] * (1 + max_spread), top
 
 
 def liquidity_score(sales: list, min_offer_sales: int = MIN_OFFER_SALES,
@@ -532,7 +550,7 @@ EXTERIOR_PREFIX = {
     "Minimal Wear": "MW", "Field-Tested": "FT",
     "Battle-Scarred": "BS",
 }
-PREMIUM_MIN_PROFIT = 2.0     # минимальная прибыль ($) по бакету, чтобы кинуть в premium-канал
+PREMIUM_MIN_PROFIT = 5.0     # минимальная прибыль ($) по бакету, чтобы кинуть в premium-канал
 # Менее строгая ликвидность для бакетов (продаж по конкретному износу мало)
 BUCKET_MIN_OFFER_SALES = 12
 BUCKET_MIN_RATE = 0.2        # продаж-офферов в день
@@ -566,8 +584,6 @@ async def analyze_premium(title: str) -> list | None:
 
     target_top: dict[str, float] = {}
     any_top = 0.0
-    print(title)
-    print(offers)
     for o in orders:
         b = o.get("attributes", {}).get("floatPartValue")
         p = int(o.get("price", 0)) / 100
@@ -599,7 +615,7 @@ async def analyze_premium(title: str) -> list | None:
         profit = avg_sale * (1 - fee) - top_t
         if profit < PREMIUM_MIN_PROFIT or net < PREMIUM_MIN_PROFIT:
             continue
-        recent = sorted(sales, key=lambda s: int(s.get("date", 0)), reverse=True)[:10]
+        recent = sorted(sales, key=lambda s: int(s.get("date", 0)), reverse=True)[:15]
         sale_lines = []
         for s in recent:
             dt = datetime.fromtimestamp(int(s.get("date", 0)), tz=KYIV).strftime("%d %b %H:%M")
@@ -771,6 +787,16 @@ async def scan_loop():
             liquid = info["liq"]["ok"]
             lines = info["lines"]
 
+            # не-премиум: верхние таргеты должны быть примерно одной цены (топ не выброс)
+            if liquid and not title.startswith("★"):
+                orders = await asyncio.to_thread(get_targets_by_title, title)
+                orders = [o for o in orders if o.get("attributes", {}).get("floatPartValue") == "any"] 
+                clustered, top_levels = _targets_top_clustered(orders)
+                top_s = " / ".join(f"${p:.2f}" for p in top_levels)
+                lines.append(f"   Топ-таргеты: {'🟢' if clustered else '🔴'} {top_s or '—'}")
+                if not clustered:
+                    liquid = False
+
             # Маршрутизация сигнала — взаимоисключающая, без дабл-постов:
             #   profit>=2 и ликвид  → авто-таргет + liquid_profit
             #   profit>0 (иначе)    → profit-канал
@@ -926,7 +952,7 @@ async def _reprice_offer(channel, title, offer_id, asset_id, my_price, my_lock=0
     if ok:
         if channel:
             await channel.send(embed=offer_update_embed(
-                title, my_price, new_price, buy_price, net, frac,
+                title, my_price, new_price, buy_price, net, my_lock / 3600, frac,
                 competitor=competitor, market=offers, my_offer_id=offer_id,
             ))
     else:

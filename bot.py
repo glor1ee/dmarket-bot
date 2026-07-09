@@ -747,7 +747,7 @@ async def scan_loop():
 
         for item in skins:
             title = item.get("title", "N/A")
-            price = int(item["price"].get("USD", 0)) / 100
+            price = item.get("price", 0.0)
 
             if price > 1000:
                 continue
@@ -1030,13 +1030,11 @@ async def offer_update_loop():
         # 1) обновляем цены уже выставленных офферов
         offers = await asyncio.to_thread(get_user_offers)
         for offer in offers:
-            title = offer.get("Title", "")
-            off = offer.get("Offer") or {}
-            offer_id = off.get("OfferID")
-            asset_id = offer.get("AssetID")
-            attrs = {a["Name"]: a["Value"] for a in offer.get("Attributes", [])}
-            my_lock = float(attrs.get("tradeLockDuration") or 0)  # сколько мой предмет ещё под защитой, сек
-            my_price = float(off.get("Price", {}).get("Amount", 0) or 0)
+            title = offer.get("title", "")
+            offer_id = offer.get("offerId")
+            asset_id = offer.get("assetId")
+            my_lock = offer.get("lock", 0.0)   # сколько мой предмет ещё под защитой, сек
+            my_price = offer.get("price", 0.0)
             if not title or not offer_id or not asset_id or my_price <= 0:
                 continue
             await _reprice_offer(channel, title, offer_id, asset_id, my_price, my_lock)
@@ -1168,9 +1166,8 @@ def format_offers(items: list, balance: float | None = None, closed: list | None
     else:
         total_price = 0.0
         for item in items:
-            title = item.get("Title", "N/A")
-            offer = item.get("Offer") or {}
-            price = float(offer.get("Price", {}).get("Amount", 0))
+            title = item.get("title", "N/A")
+            price = item.get("price", 0.0)
             frac = fees.fee_fraction(title, price)
             net = price * (1 - frac)
             total_price += price

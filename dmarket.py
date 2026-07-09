@@ -1,7 +1,7 @@
 import requests
 import os
 from dotenv import load_dotenv
-from auth import BASE_URL, GAME_ID, generate_headers
+from auth import BASE_URL, GAME_ID
 
 load_dotenv()
 _JWT = os.getenv("DMARKET_JWT", "").strip()
@@ -14,35 +14,52 @@ def _log_fail(where: str, resp=None, exc: Exception | None = None) -> None:
     elif resp is not None:
         print(f"⚠️ {where}: HTTP {resp.status_code}: {resp.text[:600]}")
 
+
+def _parse_float_part(fp: str | None) -> str | None:
+    """v2 'FLOAT_PART_BS_1' → 'BS-1'. FLOAT_PART_UNSPECIFIED/None → None."""
+    if not fp or fp == "FLOAT_PART_UNSPECIFIED" or not fp.startswith("FLOAT_PART_"):
+        return None
+    parts = fp[len("FLOAT_PART_"):].rsplit("_", 1)  # 'BS_1' → ['BS','1']
+    return "-".join(parts) if len(parts) == 2 else None
+
+
+def _parse_lock_seconds(v) -> float:
+    """v2 tradeLockDuration '480923.14s' → 480923.14; None → 0."""
+    if not v:
+        return 0.0
+    try:
+        return float(str(v).rstrip("s"))
+    except (TypeError, ValueError):
+        return 0.0
+
+# v2 orderBy: price | title | float | createdAt (v1 'updated'/'personal' убраны)
 _SORT_OPTIONS = [
     ("price", "asc"),
     ("price", "desc"),
-    ("updated", "desc"),
-    ("personal", "desc"),
+    ("createdAt", "desc"),
+    ("title", "asc"),
 ]
 _sort_idx = 0
 
 
 def get_recommended_skins() -> list:
+    """Маркет-офферы (v2/offers, JWT). Ротация сортировки. Возвращает [{title, price}]."""
     global _sort_idx
     order_by, order_dir = _SORT_OPTIONS[_sort_idx % len(_SORT_OPTIONS)]
     _sort_idx += 1
-    path = "/exchange/v1/market/items"
-    params = (
-        f"?side=market&orderBy={order_by}&orderDir={order_dir}"
-        f"&title=&priceFrom=0&priceTo=0"
-        f"&treeFilters=&gameId={GAME_ID}&types=dmarket&myFavorites=false"
-        f"&cursor=&limit=100&currency=USD&platform=browser&isLoggedIn=true"
-    )
-    headers = generate_headers("GET", path + params)
-    response = requests.get(BASE_URL + path + params, headers=headers, timeout=10)
-    if not response.text:
-        raise ValueError(f"Пустой ответ от API (статус {response.status_code})")
-    try:
-        skins = response.json().get("objects", [])
-    except Exception:
-        raise ValueError(f"Не JSON (статус {response.status_code}): {response.text[:200]}")
-    return skins
+    url = f"{BASE_URL}/marketplace-api/v2/offers"
+    params = {"gameId": GAME_ID, "limit": "100", "orderBy": order_by, "orderDir": order_dir}
+    headers = {"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    if response.status_code != 200:
+        raise ValueError(f"v2/offers статус {response.status_code}: {response.text[:200]}")
+    result = []
+    for o in response.json().get("items", []):
+        title = o.get("attributes", {}).get("title")
+        price = int(o.get("priceCents", 0)) / 100
+        if title and price > 0:
+            result.append({"title": title, "price": price})
+    return result
 
 
 def get_aggregated_prices(title: str) -> tuple[float | None, float | None]:
@@ -74,33 +91,25 @@ def get_aggregated_prices(title: str) -> tuple[float | None, float | None]:
 
 
 def get_market_offers(title: str, limit: int = 50) -> list:
-    """Офферы по конкретному скину, отсортированы по цене ↑ (HMAC).
+    """Офферы по конкретному скину, отсортированы по цене ↑ (v2/offers, JWT).
     Возвращает [(price_usd, offer_id, trade_lock_seconds), ...] — для поиска минимума
-    среди чужих (trade_lock_seconds = сколько ещё под trade-protection; 0 = уже торгуется).
-
-    ВАЖНО: фильтр title= в API подстроночный (ловит и StatTrak™-вариант),
-    поэтому оставляем только объекты с ТОЧНЫМ совпадением title."""
-    from urllib.parse import quote
-    path = "/exchange/v1/market/items"
-    params = (
-        f"?side=market&orderBy=price&orderDir=asc"
-        f"&title={quote(title)}&priceFrom=0&priceTo=0"
-        f"&treeFilters=&gameId={GAME_ID}&types=dmarket&myFavorites=false"
-        f"&cursor=&limit={limit}&currency=USD&platform=browser&isLoggedIn=true"
-    )
+    среди чужих (trade_lock_seconds = сколько ещё под trade-protection; 0 = уже торгуется)."""
+    url = f"{BASE_URL}/marketplace-api/v2/offers"
+    params = {"gameId": GAME_ID, "title": title, "limit": str(limit), "orderBy": "price", "orderDir": "asc"}
+    headers = {"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(BASE_URL + path + params, headers=generate_headers("GET", path + params), timeout=10)
+        r = requests.get(url, params=params, headers=headers, timeout=10)
         if r.status_code != 200:
             _log_fail("get_market_offers", r)
             return []
         result = []
-        for o in r.json().get("objects", []):
-            if o.get("title") != title:
-                continue  # подстроночный матч API — отсекаем чужие title
-            extra = o.get("extra") or {}
-            price = int(o.get("price", {}).get("USD", 0)) / 100
-            offer_id = extra.get("offerId")
-            lock = float(extra.get("tradeLockDuration") or 0)
+        for o in r.json().get("items", []):
+            attrs = o.get("attributes", {})
+            if attrs.get("title") != title:
+                continue  # только точный title
+            price = int(o.get("priceCents", 0)) / 100
+            offer_id = o.get("offerId")
+            lock = _parse_lock_seconds(attrs.get("tradeLockDuration"))
             if price > 0 and offer_id:
                 result.append((price, offer_id, lock))
         return result
@@ -126,18 +135,17 @@ def get_targets_by_title(title: str) -> list:
 
 
 def get_offers_by_bucket(title: str, limit: int = 100) -> dict:
-    """Мин. цена оффера (USD) по каждому floatPartValue-бакету для скина.
-    Эндпоинт offers-by-title (JWT) — ТОЧНЫЙ матч title (без StatTrak-подстроки).
-    Пагинация по курсору с дедупом по itemId (на случай не-продвигающегося курсора).
-    Возвращает {bucket: min_price}."""
-    url = f"{BASE_URL}/exchange/v1/offers-by-title"
+    """Мин. цена оффера (USD) по каждому floatPart-бакету для скина (v2/offers, JWT).
+    Точный матч title. Пагинация по курсору с дедупом по offerId.
+    Возвращает {bucket: min_price} (бакет вида 'BS-1')."""
+    url = f"{BASE_URL}/marketplace-api/v2/offers"
     headers = {"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}
     result: dict[str, float] = {}
     seen_ids: set[str] = set()
     cursor = ""
     try:
         while True:
-            params = {"gameId": GAME_ID, "title": title, "limit": str(limit)}
+            params = {"gameId": GAME_ID, "title": title, "limit": str(limit), "orderBy": "price", "orderDir": "asc"}
             if cursor:
                 params["cursor"] = cursor
             r = requests.get(url, params=params, headers=headers, timeout=10)
@@ -145,18 +153,21 @@ def get_offers_by_bucket(title: str, limit: int = 100) -> dict:
                 _log_fail("get_offers_by_bucket", r)
                 break
             data = r.json()
-            objects = data.get("objects", [])
-            new = [o for o in objects if o.get("itemId") not in seen_ids]
+            items = data.get("items", [])
+            new = [o for o in items if o.get("offerId") not in seen_ids]
             if not new:
                 break  # новых нет — конец (курсор не продвигается)
             for o in new:
-                seen_ids.add(o.get("itemId"))
-                bucket = (o.get("extra") or {}).get("floatPartValue")
-                price = int(o.get("price", {}).get("USD", 0)) / 100
+                seen_ids.add(o.get("offerId"))
+                attrs = o.get("attributes", {})
+                if attrs.get("title") != title:
+                    continue
+                bucket = _parse_float_part((attrs.get("cs2") or {}).get("floatPart"))
+                price = int(o.get("priceCents", 0)) / 100
                 if bucket and price > 0 and (bucket not in result or price < result[bucket]):
                     result[bucket] = price
             next_cursor = data.get("cursor", "")
-            if not next_cursor or next_cursor == cursor or len(objects) < limit:
+            if not next_cursor or next_cursor == cursor or len(items) < limit:
                 break
             cursor = next_cursor
     except Exception as e:
@@ -165,16 +176,41 @@ def get_offers_by_bucket(title: str, limit: int = 100) -> dict:
 
 
 def get_user_offers() -> list:
-    url = f"{BASE_URL}/marketplace-api/v1/user-offers"
-    params = {"gameId": GAME_ID, "limit": "100", "currency": "USD"}
+    """Мои активные офферы (v2/user/offers, JWT), нормализовано:
+    [{title, offerId, assetId, price, lock}]. assetId = attributes.id (UUID для v2 batchUpdate)."""
+    url = f"{BASE_URL}/marketplace-api/v2/user/offers"
+    params = {"gameId": GAME_ID, "limit": "100"}
     headers = {"Authorization": _JWT, "User-Agent": "Mozilla/5.0"}
+    result = []
+    cursor = ""
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return []
-        return r.json().get("Items", [])
-    except Exception:
-        return []
+        while True:
+            p = dict(params)
+            if cursor:
+                p["cursor"] = cursor
+            r = requests.get(url, params=p, headers=headers, timeout=10)
+            if r.status_code != 200:
+                _log_fail("get_user_offers", r)
+                break
+            data = r.json()
+            items = data.get("items", [])
+            if not items:
+                break
+            for o in items:
+                attrs = o.get("attributes", {})
+                result.append({
+                    "title": attrs.get("title", ""),
+                    "offerId": o.get("offerId"),
+                    "assetId": attrs.get("id"),
+                    "price": int(o.get("priceCents", 0)) / 100,
+                    "lock": _parse_lock_seconds(attrs.get("tradeLockDuration")),
+                })
+            cursor = data.get("cursor", "")
+            if not cursor or len(items) < int(params["limit"]):
+                break
+    except Exception as e:
+        _log_fail("get_user_offers", exc=e)
+    return result
 
 
 def jwt_is_valid() -> bool:

@@ -10,9 +10,10 @@ from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
 from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, jwt_is_valid, get_customized_fees, get_market_offers, get_closed_offers, get_targets_by_title, get_offers_by_bucket
-from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed, offer_sold_embed
+from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed, offer_sold_embed, stats_embed
 from store import get_buy_price, sync_closed_targets
 import fees
+import db
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -30,18 +31,22 @@ OFFER_UPDATE_CHANNEL_ID = 1515027974301290616
 TARTGETS_CHANNEL_ID = 1513234981269278750
 CLOSED_TARGETS_CHANNEL_ID = 1516105280499224768
 CLOSED_OFFERS_CHANNEL_ID = 1516208442967331039
+STATS_CHANNEL_ID = 1525238542706540765
 
 OWNER_USER_ID = 421320508986884096
 
 
-min_balance = 111 # если баланс меньше, не ставим авто-таргет (даже если прибыльный), чтобы не блокировать деньги в оффере при ошибке
+# Порог ЦЕНЫ авто-таргета (не баланса!): таргеты дешевле этой суммы могут занимать
+# весь баланс, дороже — не больше 70% баланса (чтобы дорогой таргет не заморозил все деньги).
+min_balance = 111
+
+# Титулы таргетов, поставленных (вручную или авто) после последнего прохода rebid_loop.
+# rebid_loop их не перебивает (свежая цена и так актуальна) и очищает список в конце цикла.
 placed_targets = []
 
 
-# TargetID закрытых таргетов, уже синхронизированных в JSON (заполняется в on_ready).
-_synced_closed_ids: set[str] = set()
-# OfferID закрытых офферов (продаж), уже обработанных (заполняется в on_ready).
-_synced_closed_offer_ids: set[str] = set()
+# Дедуп закрытых таргетов/офферов живёт в SQLite (db.py, bot.db) и переживает рестарт:
+# db.add_closed_* пишут новые записи и возвращают только их — по ним шлются сигналы.
 
 # Панель управления: счётчик сбросов seen в scan_loop + отложенные действия по нему
 _seen_reset_count = 0
@@ -61,25 +66,70 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-class DeleteTargetView(discord.ui.View):
+def _dmarket_url(title: str) -> str:
+    """Ссылка на страницу скина на DMarket."""
+    return (
+        "https://dmarket.com/ingame-items/item-list/csgo-skins"
+        f"?title={requests.utils.quote(title)}"
+    )
+
+
+async def _active_target_exists(title: str) -> bool:
+    """True, если по скину уже есть активный таргет — защита от дублей.
+    Проверяется перед каждой постановкой (авто и вручную), кроме rebid_loop:
+    там старый таргет удаляется до постановки нового.
+    При недоступном API (401 и т.п.) get_user_targets вернёт [] — проверка
+    пропустит, но в этом случае и place_target скорее всего не пройдёт."""
+    active = await asyncio.to_thread(get_user_targets, "TARGET_STATUS_ACTIVE")
+    return any(t.get("title") == title for t in active)
+
+
+# Кнопки сигналов сделаны через DynamicItem: всё состояние (title, цена, TargetID)
+# зашито в custom_id, поэтому кнопки в старых сообщениях работают и после рестарта
+# бота — обработчик восстанавливается из custom_id (client.add_dynamic_items в on_ready).
+# Лимит custom_id — 100 символов: префиксы короткие, title CS2 влезает с запасом.
+
+
+class DeleteTargetButton(discord.ui.DynamicItem[discord.ui.Button], template=r"deltarget:(?P<tid>.+)"):
+    """🗑 Удаляет таргет по TargetID из custom_id."""
+
     def __init__(self, target_id: str):
-        super().__init__(timeout=None)
+        super().__init__(discord.ui.Button(
+            label="🗑 Удалить таргет",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"deltarget:{target_id}",
+        ))
         self.target_id = target_id
 
-    @discord.ui.button(label="🗑 Удалить таргет", style=discord.ButtonStyle.danger)
-    async def delete_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(match["tid"])
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         ok, err = await asyncio.to_thread(delete_target, self.target_id)
         if ok:
-            _button.disabled = True
-            _button.label = "✅ Таргет удалён"
-            await interaction.message.edit(view=self)
+            done = discord.ui.View(timeout=None)
+            done.add_item(discord.ui.Button(
+                label="✅ Таргет удалён", style=discord.ButtonStyle.danger, disabled=True))
+            await interaction.message.edit(view=done)
             await interaction.followup.send("✅ Таргет удалён.", ephemeral=True)
         else:
             await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
 
 
+class DeleteTargetView(discord.ui.View):
+    """Обёртка: сообщение с одной кнопкой удаления таргета."""
+
+    def __init__(self, target_id: str):
+        super().__init__(timeout=None)
+        self.add_item(DeleteTargetButton(target_id))
+
+
 class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"):
+    """Модалка ручной цены таргета: валидирует число, ставит таргет,
+    постит карточку с кнопкой удаления в TARTGETS_CHANNEL."""
+
     price_input = discord.ui.TextInput(
         label="Цена таргета (USD)",
         placeholder="например: 45.50",
@@ -99,11 +149,15 @@ class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"
             return
 
         await interaction.response.defer(ephemeral=True)
+        if await _active_target_exists(self.skin_title):
+            await interaction.followup.send(
+                f"⚠️ На **{self.skin_title}** уже есть активный таргет — второй не ставлю.", ephemeral=True)
+            return
         ok, err, target_id = await asyncio.to_thread(place_target, self.skin_title, price_val)
         if ok:
             await interaction.followup.send(f"✅ Таргет поставлен: **${price_val:.2f}**", ephemeral=True)
             targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
-            placed_targets.append(self.skin_title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
+            placed_targets.append(self.skin_title)  # rebid_loop пропустит свежий таргет до конца текущего цикла
             if targets_channel and target_id:
                 await targets_channel.send(
                     embed=target_embed(self.skin_title, price_val, interaction.user),
@@ -114,15 +168,14 @@ class PlaceTargetModal(discord.ui.Modal, title="Поставить таргет"
 
 
 class LinkOnlyView(discord.ui.View):
+    """Ссылка на DMarket + (опционально) неактивная плашка с ценой уже
+    поставленного авто-таргета. Обработчиков нет — персистентность не нужна."""
+
     def __init__(self, title: str, placed_price: float | None = None):
         super().__init__(timeout=None)
-        url = (
-            "https://dmarket.com/ingame-items/item-list/csgo-skins"
-            f"?title={requests.utils.quote(title)}"
-        )
         self.add_item(discord.ui.Button(
             label="🔗 Открыть на DMarket",
-            url=url,
+            url=_dmarket_url(title),
             style=discord.ButtonStyle.link,
         ))
         if placed_price is not None:
@@ -133,36 +186,34 @@ class LinkOnlyView(discord.ui.View):
             ))
 
 
-class LinkButton(discord.ui.View):
+class AutoTargetButton(discord.ui.DynamicItem[discord.ui.Button], template=r"autotarget:(?P<cents>\d+):(?P<title>.+)"):
+    """🎯 Ставит таргет по max_target+0.02. max_target (в центах) и title — в custom_id."""
+
     def __init__(self, title: str, max_target: float):
-        super().__init__(timeout=None)
+        super().__init__(discord.ui.Button(
+            label=f"🎯 Авто-таргет (${max_target + 0.02:.2f})",
+            style=discord.ButtonStyle.success,
+            custom_id=f"autotarget:{int(round(max_target * 100))}:{title}",
+        ))
         self.title = title
         self.max_target = max_target
 
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.label == "🎯 Авто-таргет":
-                child.label = f"🎯 Авто-таргет (${max_target + 0.02:.2f})"
-                break
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(match["title"], int(match["cents"]) / 100)
 
-        url = (
-            "https://dmarket.com/ingame-items/item-list/csgo-skins"
-            f"?title={requests.utils.quote(title)}"
-        )
-        self.add_item(discord.ui.Button(
-            label="🔗 Открыть на DMarket",
-            url=url,
-            style=discord.ButtonStyle.link,
-        ))
-
-    @discord.ui.button(label="🎯 Авто-таргет", style=discord.ButtonStyle.success)
-    async def auto_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
         auto_price = round(self.max_target + 0.02, 2)
         await interaction.response.defer(ephemeral=True)
+        if await _active_target_exists(self.title):
+            await interaction.followup.send(
+                f"⚠️ На **{self.title}** уже есть активный таргет — второй не ставлю.", ephemeral=True)
+            return
         ok, err, target_id = await asyncio.to_thread(place_target, self.title, auto_price)
         if ok:
             await interaction.followup.send(f"✅ Авто-таргет поставлен: **${auto_price:.2f}**", ephemeral=True)
+            placed_targets.append(self.title)  # rebid_loop пропустит свежий таргет до конца текущего цикла
             targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
-            placed_targets.append(self.title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
             if targets_channel and target_id:
                 await targets_channel.send(
                     embed=target_embed(self.title, auto_price, interaction.user),
@@ -171,28 +222,56 @@ class LinkButton(discord.ui.View):
         else:
             await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
 
-    @discord.ui.button(label="🎯 Свой таргет", style=discord.ButtonStyle.primary)
-    async def place_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+
+class CustomTargetButton(discord.ui.DynamicItem[discord.ui.Button], template=r"customtarget:(?P<title>.+)"):
+    """🎯 Открывает модалку ручной цены таргета. Title — в custom_id."""
+
+    def __init__(self, title: str):
+        super().__init__(discord.ui.Button(
+            label="🎯 Свой таргет",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"customtarget:{title}",
+        ))
+        self.title = title
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(match["title"])
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(PlaceTargetModal(skin_title=self.title))
 
 
-class SkinInfoView(discord.ui.View):
-    """Кнопка с актуальной информацией о скине (цены, последние продажи) + ссылка."""
-    def __init__(self, title: str):
+class LinkButton(discord.ui.View):
+    """Кнопки под сигналом сканера: авто-таргет + свой таргет + ссылка на DMarket."""
+
+    def __init__(self, title: str, max_target: float):
         super().__init__(timeout=None)
-        self.title = title
-        url = (
-            "https://dmarket.com/ingame-items/item-list/csgo-skins"
-            f"?title={requests.utils.quote(title)}"
-        )
+        self.add_item(AutoTargetButton(title, max_target))
+        self.add_item(CustomTargetButton(title))
         self.add_item(discord.ui.Button(
             label="🔗 Открыть на DMarket",
-            url=url,
+            url=_dmarket_url(title),
             style=discord.ButtonStyle.link,
         ))
 
-    @discord.ui.button(label="ℹ️ Инфо о скине", style=discord.ButtonStyle.secondary)
-    async def info_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+
+class SkinInfoButton(discord.ui.DynamicItem[discord.ui.Button], template=r"skininfo:(?P<title>.+)"):
+    """ℹ️ Показывает актуальные цены и последние продажи по скину. Title — в custom_id."""
+
+    def __init__(self, title: str):
+        super().__init__(discord.ui.Button(
+            label="ℹ️ Инфо о скине",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"skininfo:{title}",
+        ))
+        self.title = title
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(match["title"])
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         (min_offer, max_target), sales = await asyncio.gather(
             asyncio.to_thread(get_aggregated_prices, self.title),
@@ -205,37 +284,49 @@ class SkinInfoView(discord.ui.View):
         await interaction.followup.send("\n".join(info["lines"]), ephemeral=True)
 
 
-class PremiumTargetView(discord.ui.View):
-    """Премиум-сигнал: ссылка + авто-таргет С ФИЛЬТРОМ по конкретному бакету износа."""
-    def __init__(self, title: str, bucket: str, top_target: float):
+class SkinInfoView(discord.ui.View):
+    """Кнопка с актуальной информацией о скине (цены, последние продажи) + ссылка."""
+
+    def __init__(self, title: str):
         super().__init__(timeout=None)
-        self.title = title
-        self.bucket = bucket
-        self.top_target = top_target
-        url = (
-            "https://dmarket.com/ingame-items/item-list/csgo-skins"
-            f"?title={requests.utils.quote(title)}"
-        )
+        self.add_item(SkinInfoButton(title))
         self.add_item(discord.ui.Button(
             label="🔗 Открыть на DMarket",
-            url=url,
+            url=_dmarket_url(title),
             style=discord.ButtonStyle.link,
         ))
 
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.label == "🎯 Авто-таргет":
-                child.label = f"🎯 Авто-таргет (${top_target + 0.02:.2f})" 
-                break
 
-    @discord.ui.button(label="🎯 Авто-таргет", style=discord.ButtonStyle.success)
-    async def auto_target_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+class PremiumTargetButton(discord.ui.DynamicItem[discord.ui.Button], template=r"premtarget:(?P<bucket>[A-Z]+-\d+):(?P<cents>\d+):(?P<title>.+)"):
+    """🎯 Ставит таргет с фильтром по бакету износа (top_target+0.02).
+    Бакет, top_target (в центах) и title — в custom_id."""
+
+    def __init__(self, title: str, bucket: str, top_target: float):
+        super().__init__(discord.ui.Button(
+            label=f"🎯 Авто-таргет (${top_target + 0.02:.2f})",
+            style=discord.ButtonStyle.success,
+            custom_id=f"premtarget:{bucket}:{int(round(top_target * 100))}:{title}",
+        ))
+        self.title = title
+        self.bucket = bucket
+        self.top_target = top_target
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]"):
+        return cls(match["title"], match["bucket"], int(match["cents"]) / 100)
+
+    async def callback(self, interaction: discord.Interaction):
         auto_price = round(self.top_target + 0.02, 2)
         await interaction.response.defer(ephemeral=True)
+        if await _active_target_exists(self.title):
+            await interaction.followup.send(
+                f"⚠️ На **{self.title}** уже есть активный таргет — второй не ставлю.", ephemeral=True)
+            return
         ok, err, target_id = await asyncio.to_thread(place_target, self.title, auto_price, self.bucket)
         if ok:
             await interaction.followup.send(
                 f"✅ Авто-таргет **{self.bucket}** на **{self.title}**: **${auto_price:.2f}**", ephemeral=True)
-            placed_targets.append(self.title)
+            placed_targets.append(self.title)  # rebid_loop пропустит свежий таргет до конца текущего цикла
             targets_channel = interaction.client.get_channel(TARTGETS_CHANNEL_ID)
             if targets_channel and target_id:
                 await targets_channel.send(
@@ -244,6 +335,19 @@ class PremiumTargetView(discord.ui.View):
                 )
         else:
             await interaction.followup.send(f"❌ Ошибка: {err}", ephemeral=True)
+
+
+class PremiumTargetView(discord.ui.View):
+    """Премиум-сигнал: авто-таргет С ФИЛЬТРОМ по конкретному бакету износа + ссылка."""
+
+    def __init__(self, title: str, bucket: str, top_target: float):
+        super().__init__(timeout=None)
+        self.add_item(PremiumTargetButton(title, bucket, top_target))
+        self.add_item(discord.ui.Button(
+            label="🔗 Открыть на DMarket",
+            url=_dmarket_url(title),
+            style=discord.ButtonStyle.link,
+        ))
 
 
 class TargetsControlView(discord.ui.View):
@@ -299,6 +403,21 @@ class InventoryControlView(discord.ui.View):
             asyncio.to_thread(get_balance),
         )
         await interaction.followup.send(embed=inventory_embed(items, balance), ephemeral=True)
+
+
+class StatsControlView(discord.ui.View):
+    """Панель статистики: по кнопке считает отчёт за 7 дней из bot.db,
+    сохраняет снапшот в stats_reports и постит эмбед в канал."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📈 Статистика за 7 дней", style=discord.ButtonStyle.primary, custom_id="stats_week")
+    async def week_stats(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer()  # не ephemeral: отчёт остаётся в канале
+        report = await asyncio.to_thread(db.stats, 7)
+        await asyncio.to_thread(db.save_report, report)
+        await interaction.followup.send(embed=stats_embed(report), ephemeral=True)
 
 
 async def _stop_bot_after(seconds: int) -> None:
@@ -558,7 +677,9 @@ BUCKET_MAX_AGE_H = 100       # свежесть последней продаж�
 
 
 def _exterior_buckets(title: str) -> list:
-    """Бакеты износа по экстерьеру из title, напр. BS-0..BS-4. [] если экстерьер не распознан."""
+    """Три нижних бакета износа по экстерьеру из title, напр. BS-0..BS-2.
+    [] если экстерьер не распознан или его нет в EXTERIOR_PREFIX
+    (Factory New и Well-Worn намеренно исключены из премиум-анализа)."""
     m = re.search(r"\(([^)]+)\)\s*$", title)
     prefix = EXTERIOR_PREFIX.get(m.group(1)) if m else None
     return [f"{prefix}-{i}" for i in range(3)] if prefix else []
@@ -806,7 +927,7 @@ async def scan_loop():
                 balance = await asyncio.to_thread(get_balance)
                 within_limit = balance is not None and auto_price <= (balance if auto_price <= min_balance else balance * 0.70)
 
-                if within_limit and auto_price > 4:
+                if within_limit and auto_price > 4 and not await _active_target_exists(title):
                     ok, _, new_id = await asyncio.to_thread(place_target, title, auto_price)
                     placed = auto_price if (ok and new_id) else None
                 else:
@@ -821,7 +942,7 @@ async def scan_loop():
                 await liquid_profit_channel.send(content="\n".join(lines), view=liquid_view)
 
                 if placed and new_id:
-                    placed_targets.append(title)  # добавляем в кэш выставленных таргетов, чтобы не предлагать ставить второй раз в scan_loop
+                    placed_targets.append(title)  # rebid_loop пропустит свежий таргет до конца текущего цикла
                     targets_channel = client.get_channel(TARTGETS_CHANNEL_ID)
                     if targets_channel:
                         await targets_channel.send(
@@ -841,14 +962,13 @@ async def rebid_loop():
     while not client.is_closed():
         await asyncio.sleep(910)
 
-        # Новые закрытые (купленные) таргеты → пишем цену покупки в JSON + сигнал
+        # Новые закрытые (купленные) таргеты → в SQLite (дедуп по TargetID) + cost-basis + сигнал
         all_closed = await asyncio.to_thread(get_closed_targets)
-        new_closed = [t for t in all_closed if t.get("TargetID", "") not in _synced_closed_ids]
+        new_closed = await asyncio.to_thread(db.add_closed_targets, all_closed)
         if new_closed:
             await asyncio.to_thread(sync_closed_targets, new_closed)
             closed_channel = client.get_channel(CLOSED_TARGETS_CHANNEL_ID)
             for t in new_closed:
-                _synced_closed_ids.add(t.get("TargetID", ""))
                 title = t.get("Title", "")
                 price = float(t.get("Price", {}).get("Amount", 0))
                 if closed_channel and title and price > 0:
@@ -892,7 +1012,7 @@ async def rebid_loop():
                         view=DeleteTargetView(target_id=new_id),
                     )
 
-        placed_targets.clear()  # сбрасываем кэш выставленных таргетов, чтобы не мешал в следующем цикле
+        placed_targets.clear()  # свежие таргеты «состарились» — со следующего цикла их можно перебивать
 
 
 def _undercut_cents(min_offer: float) -> int:
@@ -900,7 +1020,9 @@ def _undercut_cents(min_offer: float) -> int:
     return int(round(min_offer * 100)) - 1
 
 
-TRADE_PROTECT_SECONDS = 72 * 3600   # 72 часов: дольше — мой предмет «залип» под защитой
+# 72 часа: если мой предмет под trade-protection дольше, он менее привлекателен покупателю —
+# при репрайсе ориентируемся только на конкурентов с заметно меньшей защитой (см. _reprice_offer).
+TRADE_PROTECT_SECONDS = 72 * 3600
 # Ручной skip-список репрайса (правится вручную, читается свежим при каждом вызове).
 REPRICE_SKIP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reprice_skip.json")
 
@@ -916,10 +1038,12 @@ def _reprice_skip() -> set:
 
 async def _reprice_offer(channel, title, offer_id, asset_id, my_price, my_lock=0.0):
     """Подгоняет цену оффера под минимум среди чужих офферов (competitor−1¢):
-    вниз если меня перебили, вверх если я стою дешевле рынка. Только если выгодно.
+    вниз если меня перебили, вверх если я стою дешевле рынка. Двигает цену только
+    если доход против цены покупки (get_buy_price) положительный.
 
-    Если мой предмет под trade-protection дольше 60 часов — ориентируемся только на
-    конкурентов с МЕНЬШЕЙ защитой (их предметы привлекательнее, надо быть дешевле их)."""
+    Если мой предмет под trade-protection дольше TRADE_PROTECT_SECONDS (72 ч) —
+    ориентируемся только на конкурентов, чья защита короче моей минимум на 32 ч
+    (на 48 ч, если мой лок больше 120 ч): их предметы привлекательнее, надо быть дешевле их."""
     if title in _reprice_skip():
         return  # скин в ручном skip-списке — не трогаем
     buy_price = get_buy_price(title)
@@ -998,7 +1122,7 @@ async def _list_unlisted(channel, title, asset_id):
 async def offer_update_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        await asyncio.sleep(905)  # 15 минут
+        await asyncio.sleep(905)  # ~15 минут (не кратно rebid_loop, чтобы циклы не бились в API одновременно)
         channel = client.get_channel(OFFER_UPDATE_CHANNEL_ID)
 
         # Кэш комиссий обновляем не чаще раза в час (таблица большая, меняется редко)
@@ -1007,13 +1131,13 @@ async def offer_update_loop():
             if count:
                 print(f"♻️ Кэш комиссий обновлён: {count} льготных")
 
-        # Новые закрытые офферы (продажи) → сигнал «💸 Скин продан» с фактической комиссией
+        # Новые закрытые офферы (продажи) → в SQLite (дедуп по OfferID, снимок цены покупки)
+        # + сигнал «💸 Скин продан» с фактической комиссией
         all_closed = await asyncio.to_thread(get_closed_offers)
-        new_closed = [t for t in all_closed if t.get("OfferID", "") not in _synced_closed_offer_ids]
+        new_closed = await asyncio.to_thread(db.add_closed_offers, all_closed, get_buy_price)
         if new_closed:
             sold_channel = client.get_channel(CLOSED_OFFERS_CHANNEL_ID)
             for t in new_closed:
-                _synced_closed_offer_ids.add(t.get("OfferID", ""))
                 title = t.get("Title", "")
                 price = float(t.get("Price", {}).get("Amount", 0))
                 fee_obj = t.get("Fee") or {}
@@ -1052,22 +1176,22 @@ async def offer_update_loop():
 
 
 async def _notify_owner(text: str) -> None:
-    """Сообщение владельцу: сначала ЛС, при неудаче — пинг в первом доступном канале."""
+    """Шлёт владельцу ЛС. При неудаче (закрытые ЛС и т.п.) только пишет в консоль —
+    fallback-а через каналы нет."""
     if not OWNER_USER_ID:
         return
     try:
         owner = await client.fetch_user(OWNER_USER_ID)
         await owner.send(text)
         print("📩 Владельцу отправлено в ЛС")
-        return
     except Exception as e:
-        print(f"⚠️ ЛС не прошло ({e}); пробую упомянуть в канале")
+        print(f"⚠️ ЛС владельцу не прошло: {e}")
 
 
 @client.event
 async def on_ready():
-    global _synced_closed_ids, _synced_closed_offer_ids
     print(f"✅ Бот запущен как {client.user}")
+    db.init()
 
     # Уведомление владельцу при старте: сначала ЛС, при неудаче — пинг в канале
     await _notify_owner("Иди к успеху мужик")
@@ -1078,16 +1202,16 @@ async def on_ready():
     else:
         print("🔑 ВНИМАНИЕ: JWT протух/невалиден (401). Обнови DMARKET_JWT в .env и перезапусти бота — приватные функции (офферы, таргеты, инвентарь) работать не будут.")
 
-    # Стартовая синхронизация цен покупки из закрытых таргетов
+    # Стартовая синхронизация закрытых сделок в SQLite (без сигналов: всё, что
+    # закрылось пока бот был выключен, просто дописывается в БД) + cost-basis
     closed = await asyncio.to_thread(get_closed_targets)
     count = await asyncio.to_thread(sync_closed_targets, closed)
-    _synced_closed_ids = {t.get("TargetID", "") for t in closed}
-    print(f"📥 Синхронизировано закрытых таргетов: {count}")
+    new_targets = await asyncio.to_thread(db.add_closed_targets, closed)
+    print(f"📥 cost-basis обновлён: {count}; новых закрытых таргетов в БД: {len(new_targets)}")
 
-    # Запоминаем уже закрытые офферы (продажи), чтобы не слать сигналы по старым
     closed_offers = await asyncio.to_thread(get_closed_offers)
-    _synced_closed_offer_ids = {t.get("OfferID", "") for t in closed_offers}
-    print(f"📥 Закрытых офферов (продаж) при старте: {len(_synced_closed_offer_ids)}")
+    new_offers = await asyncio.to_thread(db.add_closed_offers, closed_offers, get_buy_price)
+    print(f"📥 Новых закрытых офферов (продаж) в БД: {len(new_offers)}")
 
     # Кэш комиссий на продажу (для реального net в офферах)
     fee_count = fees.update(await asyncio.to_thread(get_customized_fees))
@@ -1097,6 +1221,12 @@ async def on_ready():
     client.add_view(OffersControlView())
     client.add_view(InventoryControlView())
     client.add_view(ControlPanelView())
+    client.add_view(StatsControlView())
+    # Динамические кнопки сигналов: восстанавливаются из custom_id после рестарта
+    client.add_dynamic_items(
+        DeleteTargetButton, AutoTargetButton, CustomTargetButton,
+        SkinInfoButton, PremiumTargetButton,
+    )
 
     my_targets_channel = client.get_channel(MY_TARGETS_CHANNEL_ID)
     if my_targets_channel:
@@ -1113,6 +1243,14 @@ async def on_ready():
                 await msg.delete()
                 break
         await my_offers_channel.send("📦 **Мои офферы**", view=OffersControlView())
+
+    stats_channel = client.get_channel(STATS_CHANNEL_ID)
+    if stats_channel:
+        async for msg in stats_channel.history(limit=5):
+            if msg.author == client.user and msg.content == "📈 **Статистика**":
+                await msg.delete()
+                break
+        await stats_channel.send("📈 **Статистика**", view=StatsControlView())
 
     control_channel = client.get_channel(CONTROL_CHANNEL_ID)
     if control_channel:

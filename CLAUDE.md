@@ -2,88 +2,127 @@
 
 ## Что это
 
-Discord-бот для арбитража CS2-скинов на DMarket: ищет выгодные лоты, сравнивает минимальный оффер продавцов с максимальным таргетом (buy order) покупателей, считает чистую прибыль после комиссии 10%, постит сигналы в Discord и **автоматически** ставит таргеты, перебивает их и управляет своими офферами на продажу.
+Discord-бот для арбитража CS2-скинов на DMarket: ищет выгодные лоты, сравнивает минимальный оффер продавцов с максимальным таргетом (buy order) покупателей, считает чистую прибыль с учётом **реальной** комиссии (10% по умолчанию, у части скинов льготная — см. `fees.py`), постит сигналы в Discord и **автоматически** ставит таргеты, перебивает их и управляет своими офферами на продажу. Для ножей/перчаток (★) есть отдельный премиум-анализ по бакетам износа (float).
 
 ## Файлы
 
-- `auth.py` — HMAC-SHA256 подпись (`X-Request-Sign: dmarket <hex>`), ключи из `.env`
-- `dmarket.py` — API-клиент DMarket (лоты, цены, таргеты, офферы, инвентарь, закрытые таргеты)
+- `auth.py` — константы `BASE_URL`, `GAME_ID` + легаси HMAC-подпись (`generate_headers`, в основном коде уже не используется)
+- `dmarket.py` — API-клиент DMarket (маркет-офферы, цены, таргеты, офферы, инвентарь, закрытые таргеты/офферы, комиссии)
+- `fees.py` — in-memory кэш комиссий на продажу: дефолт 10%, льготные позиции (~12.5к) с диапазоном цены и сроком действия
+- `db.py` — SQLite-хранилище `bot.db`: закрытые таргеты (покупки), закрытые офферы (продажи), снапшоты статистики; дедуп сделок переживает рестарт
 - `store.py` — cost-basis: `title -> цена покупки`, хранится в `cost_basis.json`
 - `embed.py` — сборка Discord-эмбедов
-- `bot.py` — Discord-бот: UI-кнопки/модалки + три фоновых цикла
-- `test_*.py` — ручные диагностики (баланс, офферы, создание оффера, совпадение title)
+- `bot.py` — Discord-бот: UI-кнопки/модалки, контрольная панель + три фоновых цикла
+- `sync_closed.py` — ручная синхронизация закрытых таргетов в `cost_basis.json` (`python sync_closed.py`)
+- `test_targets_filter.py` — ручная диагностика (в `.gitignore`)
 - `.env` — `DISCORD_TOKEN`, `DMARKET_JWT`, `DMARKET_PUBLIC_KEY`, `DMARKET_SECRET_KEY`
+- `reprice_skip.json` — ручной skip-список репрайса (точные title), читается свежим при каждом вызове; в `.gitignore`
 
 ## Аутентификация (важно)
 
-Два метода, оба используются:
-- **HMAC** (`auth.generate_headers`) — только для `get_recommended_skins` (`/exchange/v1/market/items`). Стабильный.
-- **JWT** (`DMARKET_JWT`, заголовок `Authorization`) — для всего остального (цены, таргеты, офферы, инвентарь, баланс, закрытые таргеты). **Короткоживущий — периодически протухает (HTTP 401).**
+Весь основной код работает по **JWT** (`DMARKET_JWT`, заголовок `Authorization`): маркет-офферы, цены, таргеты, офферы, инвентарь, баланс, закрытые сделки, комиссии. **Токен короткоживущий — периодически протухает (HTTP 401).** Валидность проверяется на старте (`jwt_is_valid`, лёгкий запрос баланса) с предупреждением в консоль.
+
+HMAC-подпись (`auth.generate_headers`, `X-Request-Sign`) осталась только в ручной диагностике `test_targets_filter.py`.
 
 ## Ключевая логика прибыли
 
 ```
-net = min_offer * 0.90 - max_target      # комиссия DMarket 10%
+fee = fees.fee_fraction(title, price)        # 0.10 или льготная (напр. 0.02)
+net    = min_offer * (1 - fee) - max_target  # прибыль от перепродажи по мин. офферу
+profit = avg_offer * (1 - fee) - max_target  # прибыль от средней цены офферных продаж
 ```
-Сигнал по скину: `1 <= net <= 10`, цена оффера <= $100.
+`avg_offer` считается без премиальных низко-float продаж (бакет −0), чтобы они не надували профит (`_premium_float_threshold`).
 
 ## Цикл сканирования (`scan_loop`)
 
-Перебирает рекомендованные скины (сортировка ротируется по 4 вариантам). Для прошедших фильтр прибыли тянет last-sales (10 шт.), считает ликвидность и постит сигнал в `PROFIT_CHANNEL`/`REVIEW_CHANNEL`.
+Перебирает маркет-офферы (`get_recommended_skins`, v2/offers; сортировка ротируется по 4 вариантам). Скины дороже $1000 и уже виденные (`seen`, сброс каждые 2 часа) пропускаются. Предфильтр: `net >= 3`. Дальше тянет last-sales (30 шт.), строит `build_skin_info` (метрики + текст сигнала).
 
-**Ликвидность** (`_count_large_gaps`): был день с ≥3 продажами И не более `MAX_LARGE_GAPS` (2) разрывов между продажами длиннее `MAX_SALE_GAP_DAYS` (2 дня), считая и разрыв до «сейчас».
+**Ликвидность** (`liquidity_score`): ≥12 продаж через офферы в выборке, скорость ≥1 оффер-продажа/день, последняя продажа не старше 36 ч, и **нет всплеска** >3 продаж за 5 минут (`_has_burst` — защита от накрутки).
 
-**Авто-таргет** ставится только если: `profit > 0` И `liquid` И офферов в истории больше, чем таргетов (`len(offer_prices) > len(target_prices)`) И цена `auto_price = max_target + 0.02` влезает в 60% баланса И `auto_price > 5`.
+**Топ-таргеты** (не-премиум): верхние 5 разных ценовых уровней таргетов (`floatPartValue == "any"`) должны укладываться в 1% (`_targets_top_clustered`) — иначе топ-таргет считается выбросом и сигнал понижается до review.
+
+**Маршрутизация** (взаимоисключающая):
+- `profit >= 2` и ликвидно → авто-таргет + `LIQUID_PROFIT`
+- `profit > 0` (иначе) → `PROFIT`
+- ликвидно, `profit <= 0` → `REVIEW`; неликвидный мусор не постится
+
+**Авто-таргет**: цена `max_target + 0.02`, ставится если `auto_price > 4`, влезает в лимит баланса (таргеты дешевле `min_balance` ($111) могут занимать весь баланс, дороже — не больше 70%; осторожно: `min_balance` — порог **цены**, не баланса) и по скину **нет активного таргета** (`_active_target_exists` — защита от дублей; та же проверка стоит на всех кнопках/модалке постановки таргета; `rebid_loop` не проверяет — он сначала удаляет свой старый таргет).
+
+**Премиум (★ ножи/перчатки)** — `analyze_premium`: по каждому из трёх нижних бакетов износа (`MW/FT/BS`-0..2; FN и WW исключены) берёт фильтрованные last-sales, мягкую ликвидность (≥12 оффер-продаж, ≥0.2/день, свежесть ≤100 ч) и прибыль от средней цены продаж бакета; в `PREMIUM`-канал идут бакеты с `profit` и `net` > $5, кнопка ставит таргет с фильтром `Attrs.floatPartValue`.
 
 При ошибке API — `sleep(30)` и продолжаем (не busy-loop).
 
-## Цикл перебивки таргетов (`rebid_loop`, каждые 905 с)
+## Цикл перебивки таргетов (`rebid_loop`, каждые 910 с)
 
-1. **Синхронизация cost-basis**: тянет закрытые (купленные) таргеты `get_closed_targets`, новые (по `TargetID`) пишет в `cost_basis.json` через `sync_closed_targets` и шлёт «🛒 Куплен по таргету» в `CLOSED_TARGETS_CHANNEL`. Уже синхронизированные ID лежат в `_synced_closed_ids` (стартово заполняется в `on_ready`).
-2. **Перебивка**: по активным таргетам — если меня перекрыли (`max_target > my_price`) и всё ещё выгодно (`1 <= net <= 10`): удаляет старый таргет, ставит новый по `max_target + 0.02`. Если стало невыгодно — просто удаляет.
+1. **Синхронизация покупок**: тянет закрытые (купленные) таргеты `get_closed_targets`; `db.add_closed_targets` пишет их в SQLite (дедуп по `TargetID`, PRIMARY KEY) и возвращает только новые — по ним обновляется cost-basis (`sync_closed_targets`) и шлётся «🛒 Куплен по таргету» в `CLOSED_TARGETS_CHANNEL` (с кнопкой ℹ️ инфо). При старте `on_ready` делает ту же синхронизацию без сигналов (сделки за время оффлайна дописываются в БД молча).
+2. **Перебивка**: по активным таргетам — если меня перекрыли (`max_target > my_price`): при `net >= 2` удаляет старый таргет и ставит новый по `max_target + 0.02`; при `net < 2` просто удаляет (невыгодно). Таргеты из `placed_targets` (поставленные после прошлого прохода) пропускаются; список очищается в конце цикла.
 
 ## Цикл управления офферами (`offer_update_loop`, каждые 905 с)
 
-- **Шаг 1 — репрайс существующих офферов** (`_reprice_offer`): если кто-то на маркете дешевле меня (`min_offer < my_price`), снижает цену до `min_offer − 1¢` через v2 `batchUpdate`. Только если `get_buy_price(title)` известна и доход `new_price*0.90 − buy_price > 0`.
-- **Шаг 2 — автолистинг** (`_list_unlisted`): по предметам инвентаря с `inMarket=True` (предмет на стороне DMarket, доступен к продаже — не требует трейда Steam→DMarket) и UUID в `attributes.id` выставляет оффер по `min_offer − 1¢` через v2 `batchCreate`. Если cost-basis известна — с проверкой дохода; если нет — выставляет с пометкой «цена покупки неизвестна».
+- **Кэш комиссий** обновляется не чаще раза в час (`fees.is_stale`).
+- **Закрытые офферы (продажи)**: `db.add_closed_offers` пишет их в SQLite (дедуп по `OfferID`; в строку снимается текущая цена покупки из cost-basis; у уже известных офферов обновляется статус `trade_protected` → `successful`). Новые → сигнал «💸 Скин продан» в `CLOSED_OFFERS_CHANNEL` с фактической комиссией, статусом и прибылью против cost-basis.
+- **Шаг 1 — репрайс** (`_reprice_offer`): цена подгоняется под минимум среди **чужих** офферов (competitor − 1¢) — и вниз, и вверх. Только если title не в `reprice_skip.json`, `get_buy_price` известна и новый доход положительный. Если мой предмет под trade-protection дольше 72 ч (`TRADE_PROTECT_SECONDS`) — конкурентами считаются только офферы с защитой короче моей минимум на 32 ч (48 ч при моём локе >120 ч).
+- **Шаг 2 — автолистинг** (`_list_unlisted`): по предметам инвентаря с `inMarket=True` и UUID в `attributes.id` (`DEPOSITED_RE` — только депонированные, для Steam-предметов batchCreate недоступен) выставляет оффер по `min_offer − 1¢`. Если cost-basis известна — с проверкой дохода; если нет — выставляет с пометкой «цена покупки неизвестна».
 
   Примечание: `inMarket` НЕ означает «уже есть активный оффер» — это «лежит у DMarket и может быть выставлен». Предметы с активным оффером в списке свободных инвентарных не появляются, поэтому дублей `batchCreate` на практике нет.
 
-Цена оффера всегда `_undercut_cents(min_offer) = round(min_offer*100) − 1` (на 1 цент ниже минимального оффера).
+Цена оффера всегда `_undercut_cents(x) = round(x*100) − 1` (на 1 цент ниже ориентира).
+
+## UI (Discord)
+
+- **Кнопки сигналов** (`DeleteTargetButton`, `AutoTargetButton`, `CustomTargetButton`, `SkinInfoButton`, `PremiumTargetButton`) сделаны через `discord.ui.DynamicItem`: состояние (title, цена, TargetID) зашито в `custom_id`, поэтому кнопки **переживают рестарт бота** (регистрация — `client.add_dynamic_items` в `on_ready`). Лимит `custom_id` — 100 символов.
+- **Панели** (`TargetsControlView`, `OffersControlView`, `InventoryControlView`, `ControlPanelView`) — персистентные view с фиксированными `custom_id`, пересоздаются в своих каналах при старте.
+- **Контрольная панель**: стоп бота / выключение ПК (по таймеру в минутах или по числу сбросов `seen`), пауза/возобновление `scan_loop` (сразу или по таймеру), отмена всего. ⚠️ Проверки на владельца (`OWNER_USER_ID`) на кнопках нет.
+- `!стоп` в любом канале останавливает бота (тоже без проверки автора).
+
+## База данных (`db.py`, `bot.db`)
+
+SQLite, три таблицы: `closed_targets` (покупки: TargetID PK, title, цена, `closed_at`), `closed_offers` (продажи: OfferID PK, цена, фактическая комиссия, статус, `buy_price` — снимок цены покупки на момент записи, `closed_at`), `stats_reports` (JSON-снапшоты отчётов). Дедуп через `INSERT OR IGNORE` — `add_closed_*` возвращают только реально новые записи, по ним и шлются сигналы. Файл в `.gitignore`. Доступ под `threading.Lock` (вызовы из `asyncio.to_thread`).
+
+## Статистика (`STATS_CHANNEL_ID`)
+
+Панель «📈 Статистика» (`StatsControlView`, персистентная) в канале статистики. Кнопка «за 7 дней» считает отчёт из `bot.db` (`db.stats`): покупки (кол-во/сумма), продажи (кол-во, брутто, комиссии, чистыми, из них trade-protected), реализованная прибыль по продажам с известной ценой покупки, топ-5 продаж по прибыли. Каждый отчёт сохраняется снапшотом в `stats_reports` (`db.save_report`) и постится эмбедом в канал (не ephemeral). ⚠️ `STATS_CHANNEL_ID = 121212` — плейсхолдер, заменить на реальный ID.
 
 ## cost-basis (`store.py`)
 
-`cost_basis.json`: `{ "<title>": <цена покупки USD> }`. Заполняется **только** из закрытых таргетов (`sync_closed_targets`, ключ = `Trade["Title"]`, при дубле берётся более поздний по `ClosedAt`). `get_buy_price(title)` — точное совпадение по title. Файл в `.gitignore`.
+`cost_basis.json`: `{ "<title>": <цена покупки USD> }`. Заполняется **только** из закрытых таргетов (`sync_closed_targets`, ключ = `Trade["Title"]`, при дубле берётся более поздний по `ClosedAt`). `get_buy_price(title)` — точное совпадение по title. Файл в `.gitignore`. Запись атомарная (tmp + `os.replace`), доступ под `threading.Lock`.
 
-Совпадение title между источниками проверено (`test_title_match.py`): офферы (`offer["Title"]`) и инвентарь (`attributes.title`) используют те же полные market-hash-имена, что и закрытые таргеты — расхождений нет.
+Совпадение title между источниками проверено: офферы и инвентарь используют те же полные market-hash-имена, что и закрытые таргеты — расхождений нет.
 
-## API DMarket
+## Комиссии (`fees.py`)
 
-- Лоты: `GET /exchange/v1/market/items` (HMAC)
+`GET /exchange/v1/customized-fees` → `{defaultFee, reducedFees}` (~12.5к позиций, ~2 МБ, одним ответом). Кэш в памяти под локом, `fee_fraction(title, price)` учитывает ценовой диапазон (`minPrice`/`maxPrice`, в центах) и срок действия (`expiresAt`). Обновление: на старте и раз в час в `offer_update_loop`.
+
+## API DMarket (все JWT)
+
+- Маркет-офферы: `GET /marketplace-api/v2/offers` (листинг с ротацией сортировок; тот же эндпоинт с `title=` — офферы по скину и по-бакетные минимумы)
 - Агрег. цены: `POST /marketplace-api/v1/aggregated-prices` → `offerBestPrice` / `orderBestPrice`
-- Last-sales: `GET /trade-aggregator/v1/last-sales`
-- Таргеты: `POST .../user-targets/create`, `.../delete`, `GET /v2/user/targets`, `GET .../user-targets/closed`
-- Офферы: `GET /v1/user-offers`, `POST /v2/offers:batchCreate`, `POST /v2/offers:batchUpdate`
-- Инвентарь: `GET /v2/user/inventory` (пагинация по `cursor`)
+- Таргеты по скину: `GET /marketplace-api/v1/targets-by-title/{gameId}/{title}` (с разбивкой по `floatPartValue`)
+- Last-sales: `GET /trade-aggregator/v1/last-sales` (опц. серверный фильтр по бакету износа)
+- Таргеты: `POST .../user-targets/create` (опц. `Attrs.floatPartValue`), `.../delete`, `GET /marketplace-api/v2/user/targets`, `GET .../user-targets/closed`
+- Офферы: `GET /marketplace-api/v2/user/offers`, `POST /v2/offers:batchCreate`, `POST /v2/offers:batchUpdate`
+- Инвентарь: `GET /marketplace-api/v2/user/inventory` (пагинация по `cursor`)
 - Баланс: `GET /account/v1/balance`
+- Комиссии: `GET /exchange/v1/customized-fees`
 
-`get_closed_targets` обходит баг пагинации DMarket (курсор не продвигается) через отслеживание `seen TargetID`.
+`get_closed_targets` / `get_closed_offers` / `get_offers_by_bucket` обходят баг пагинации DMarket (курсор не продвигается) через отслеживание seen-ID.
 
 ## Каналы Discord (ID в `bot.py`)
 
-`PROFIT` / `REVIEW` / `LIQUID_PROFIT` — сигналы сканера; `MY_TARGETS` / `MY_OFFERS` / `MY_INVENTORY` — панели управления; `TARTGETS` — поставленные таргеты; `TARTGET_UPDATE` — перебивки; `OFFER_UPDATE` — изменения офферов; `CLOSED_TARGETS` — покупки.
+`PROFIT` / `REVIEW` / `LIQUID_PROFIT` / `PREMIUM` — сигналы сканера; `CONTROL` — контрольная панель; `MY_TARGETS` / `MY_OFFERS` / `MY_INVENTORY` — панели управления; `TARTGETS` — поставленные таргеты; `TARTGET_UPDATE` — перебивки; `OFFER_UPDATE` — изменения офферов; `CLOSED_TARGETS` — покупки; `CLOSED_OFFERS` — продажи; `STATS` — статистика (ID — плейсхолдер).
 
 ## Известные проблемы / TODO
 
-- **JWT молча протухает**: GET-функции (`get_user_inventory`, `get_user_offers`, `get_aggregated_prices`, `get_user_targets`) при 401 возвращают `[]`/`None` **без сигнала** — бот тихо простаивает. Добавить `_log_fail`/Discord-алерт при 401.
-- **Отладочные `print`** в `_list_unlisted` (`buy_price`, `ok/err`) — убрать.
-- **Текст про «ретраи»** в логе `rebid_loop` устарел (ретраев в коде уже нет).
-- `format_targets` в `bot.py` — мёртвый код.
+- **Нет проверки владельца на опасных кнопках**: контрольная панель (в т.ч. выключение ПК через `os.system("shutdown /s /t 0")`), `!стоп`, авто-таргеты — доступны любому, кто видит канал. `OWNER_USER_ID` объявлен, но не используется для авторизации.
+- **JWT молча протухает в горячем пути**: `get_aggregated_prices`, `get_user_targets`, `get_user_inventory`, `get_balance`, `get_last_sales` при 401 возвращают `[]`/`None` без `_log_fail` — циклы крутятся вхолостую без сигнала. Проверка `jwt_is_valid` только на старте; нужен периодический чек + алерт владельцу.
+- **`rebid_loop`: удалил — не поставил**: если `delete_target` прошёл, а `place_target` упал (rate-limit, таймаут), таргет теряется молча.
+- **`get_user_targets` без пагинации** (`limit=100`, курсор не обходится) — при >100 активных таргетов часть не видна `rebid_loop`.
 - Нет пауз между API-вызовами внутри циклов — риск rate-limit.
+- `format_targets` в `bot.py` — мёртвый код.
 
 ## Запуск
 
 ```
-python bot.py                  # Discord-бот
-python test_title_match.py     # диагностика совпадения title (только GET)
+python bot.py             # Discord-бот
+python sync_closed.py     # ручная синхронизация закрытых таргетов в cost_basis.json
 ```

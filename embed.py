@@ -1,4 +1,39 @@
 import discord
+from datetime import datetime
+
+
+def stats_embed(s: dict) -> discord.Embed:
+    """Отчёт по сделкам за период (данные из db.stats)."""
+    embed = discord.Embed(title=f"📈 Статистика за {s['period_days']} дн.", color=discord.Color.blurple())
+    b, o, p = s["buys"], s["sales"], s["profit"]
+    embed.add_field(
+        name="🛒 Покупки (таргеты)",
+        value=f"**{b['count']}** шт. на **${b['sum']:.2f}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="💸 Продажи (офферы)",
+        value=(
+            f"**{o['count']}** шт. на **${o['gross']:.2f}**\n"
+            f"комиссии **${o['fees']:.2f}** → чистыми **${o['net']:.2f}**\n"
+            f"🔒 из них trade-protected: **{o['trade_protected']}** шт. (**${o['pending_net']:.2f}**)"
+        ),
+        inline=False,
+    )
+    sign = "🟢" if p["realized"] >= 0 else "🔴"
+    embed.add_field(
+        name="📊 Прибыль (продажи с известной ценой покупки)",
+        value=f"**{p['count']}** шт. → {sign} **${p['realized']:.2f}**",
+        inline=False,
+    )
+    if s["top_sales"]:
+        lines = [
+            f"{'🟢' if t['profit'] >= 0 else '🔴'} **{t['title']}** — чистыми ${t['net']:.2f}, прибыль **${t['profit']:.2f}**"
+            for t in s["top_sales"]
+        ]
+        embed.add_field(name="🏆 Топ продаж по прибыли", value="\n".join(lines), inline=False)
+    embed.set_footer(text=f"период с {datetime.fromtimestamp(s['since']).strftime('%d.%m.%Y %H:%M')}")
+    return embed
 
 
 def rebid_embed(title: str, old_price: float, new_price: float, net: float) -> discord.Embed:

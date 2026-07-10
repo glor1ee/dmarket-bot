@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 KYIV = timezone(timedelta(hours=3))
-from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, jwt_is_valid, get_customized_fees, get_market_offers, get_closed_offers, get_targets_by_title, get_offers_by_bucket
+from dmarket import get_recommended_skins, get_aggregated_prices, get_last_sales, place_target, delete_target, get_user_targets, get_user_offers, get_user_inventory, get_balance, create_offer, update_offer, get_closed_targets, auth_is_valid, get_customized_fees, get_market_offers, get_closed_offers, get_targets_by_title, get_offers_by_bucket
 from embed import target_embed, my_targets_embed, inventory_embed, rebid_embed, offer_update_embed, offer_create_embed, offer_create_no_buy_embed, offer_sold_embed, stats_embed
 from store import get_buy_price, sync_closed_targets
 import fees
@@ -47,6 +47,13 @@ placed_targets = []
 
 # Дедуп закрытых таргетов/офферов живёт в SQLite (db.py, bot.db) и переживает рестарт:
 # db.add_closed_* пишут новые записи и возвращают только их — по ним шлются сигналы.
+
+# Здоровье авторизации: бот работает по НЕ протухающим ключам Trading API
+# (Ed25519-подпись, см. dmarket.py). auth_watch_loop раз в AUTH_CHECK_INTERVAL
+# делает лёгкий запрос баланса; если ключи отозваны/перегенерированы — все три
+# рабочих цикла пропускают итерации (не спамят API), владельцу уходит ЛС.
+AUTH_CHECK_INTERVAL = 600  # секунд между проверками авторизации
+_auth_ok = True
 
 # Панель управления: счётчик сбросов seen в scan_loop + отложенные действия по нему
 _seen_reset_count = 0
@@ -833,6 +840,30 @@ def build_skin_info(title: str, sales: list, min_offer: float | None = None,
     }
 
 
+async def auth_watch_loop():
+    """Раз в AUTH_CHECK_INTERVAL проверяет ключи Trading API (они не протухают,
+    но могут быть отозваны/перегенерированы, плюс ловим долгие сбои сети/API).
+    Авторизация упала → _auth_ok=False (циклы пропускают итерации) + ЛС владельцу;
+    восстановилась → возобновление + ЛС."""
+    global _auth_ok
+    await client.wait_until_ready()
+    while not client.is_closed():
+        ok = await asyncio.to_thread(auth_is_valid)
+        if not ok and _auth_ok:
+            _auth_ok = False
+            print("🔑 Авторизация DMarket не работает — циклы на паузе")
+            await _notify_owner(
+                "🔑 **Авторизация DMarket не работает** — сканер, перебивка и офферы на паузе.\n"
+                "Ключи не протухают сами: проверь, не перегенерированы ли они в настройках DMarket "
+                "(тогда обнови DMARKET_PUBLIC_KEY/DMARKET_SECRET_KEY в .env и перезапусти), либо это сбой API — тогда само восстановится."
+            )
+        elif ok and not _auth_ok:
+            _auth_ok = True
+            print("🔑 Авторизация восстановилась — циклы возобновлены")
+            await _notify_owner("✅ Авторизация DMarket снова работает — бот возобновил работу.")
+        await asyncio.sleep(AUTH_CHECK_INTERVAL)
+
+
 async def scan_loop():
     global _seen_reset_count
     await client.wait_until_ready()
@@ -843,8 +874,8 @@ async def scan_loop():
     seen_reset_at = asyncio.get_event_loop().time()
 
     while not client.is_closed():
-        if not _scan_active:
-            await asyncio.sleep(5)  # пауза скана — ждём активации
+        if not _scan_active or not _auth_ok:
+            await asyncio.sleep(5)  # пауза скана (вручную или авторизация упала) — ждём
             continue
         if asyncio.get_event_loop().time() - seen_reset_at >= 7200:
             seen.clear()
@@ -961,6 +992,8 @@ async def rebid_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         await asyncio.sleep(910)
+        if not _auth_ok:
+            continue  # авторизация упала — не спамим API, ждём восстановления
 
         # Новые закрытые (купленные) таргеты → в SQLite (дедуп по TargetID) + cost-basis + сигнал
         all_closed = await asyncio.to_thread(get_closed_targets)
@@ -1123,6 +1156,8 @@ async def offer_update_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         await asyncio.sleep(905)  # ~15 минут (не кратно rebid_loop, чтобы циклы не бились в API одновременно)
+        if not _auth_ok:
+            continue  # авторизация упала — не спамим API, ждём восстановления
         channel = client.get_channel(OFFER_UPDATE_CHANNEL_ID)
 
         # Кэш комиссий обновляем не чаще раза в час (таблица большая, меняется редко)
@@ -1196,11 +1231,18 @@ async def on_ready():
     # Уведомление владельцу при старте: сначала ЛС, при неудаче — пинг в канале
     await _notify_owner("Иди к успеху мужик")
 
-    # Проверка JWT при старте — токен короткоживущий, протухает периодически
-    if await asyncio.to_thread(jwt_is_valid):
-        print("🔑 JWT валиден")
+    # Проверка ключей Trading API при старте (они не протухают, но могут быть
+    # отозваны/перегенерированы). Дальше следит auth_watch_loop (алерт в ЛС + пауза циклов).
+    global _auth_ok
+    _auth_ok = await asyncio.to_thread(auth_is_valid)
+    if _auth_ok:
+        print("🔑 Авторизация DMarket работает (ключи Trading API)")
     else:
-        print("🔑 ВНИМАНИЕ: JWT протух/невалиден (401). Обнови DMARKET_JWT в .env и перезапусти бота — приватные функции (офферы, таргеты, инвентарь) работать не будут.")
+        print("🔑 ВНИМАНИЕ: авторизация не работает. Проверь DMARKET_PUBLIC_KEY/DMARKET_SECRET_KEY в .env (перегенерированы?) — циклы на паузе.")
+        await _notify_owner(
+            "🔑 **Авторизация DMarket не работает уже на старте** — циклы на паузе.\n"
+            "Проверь ключи DMARKET_PUBLIC_KEY/DMARKET_SECRET_KEY в .env."
+        )
 
     # Стартовая синхронизация закрытых сделок в SQLite (без сигналов: всё, что
     # закрылось пока бот был выключен, просто дописывается в БД) + cost-basis
@@ -1272,6 +1314,7 @@ async def on_ready():
         )
         await my_inventory_channel.send(embed=inventory_embed(items, balance))
 
+    asyncio.ensure_future(auth_watch_loop())
     asyncio.ensure_future(scan_loop())
     asyncio.ensure_future(rebid_loop())
     asyncio.ensure_future(offer_update_loop())
